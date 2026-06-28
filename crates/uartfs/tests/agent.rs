@@ -37,7 +37,9 @@ fn agent_receives_and_verifies_blob() {
     let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
     t.ping().unwrap();
 
-    let data: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(37) % 256) as u8).collect();
+    let data: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(37) % 256) as u8)
+        .collect();
     let sha = t.send_blob(1, &data, 1024).unwrap();
     assert_eq!(sha, sha256_hex(&data));
 
@@ -70,7 +72,9 @@ fn agent_exec_larger_output_chunked() {
     t.ping().unwrap();
 
     // ~2 KB of output forces multiple OUT frames; host concatenates + verifies sha
-    let r = t.exec("for i in $(seq 1 200); do printf 'line-%03d\\n' \"$i\"; done").unwrap();
+    let r = t
+        .exec("for i in $(seq 1 200); do printf 'line-%03d\\n' \"$i\"; done")
+        .unwrap();
     assert_eq!(r.code, 0);
     let text = String::from_utf8(r.stdout).unwrap();
     assert!(text.contains("line-001"));
@@ -93,7 +97,12 @@ fn push_then_apply_roundtrip() {
     let dest = agent.dir.join("delivered.txt");
     let blob = agent.dir.join("2/out");
     let r = t
-        .exec(&format!("cp '{}' '{}' && cat '{}'", blob.display(), dest.display(), dest.display()))
+        .exec(&format!(
+            "cp '{}' '{}' && cat '{}'",
+            blob.display(),
+            dest.display(),
+            dest.display()
+        ))
         .unwrap();
     assert_eq!(r.code, 0);
     assert_eq!(r.stdout, payload);
@@ -132,7 +141,9 @@ fn command_flash_to_file_target_verifies() {
     let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
     t.ping().unwrap();
 
-    let image: Vec<u8> = (0..5000u32).map(|i| (i.wrapping_mul(7) % 256) as u8).collect();
+    let image: Vec<u8> = (0..5000u32)
+        .map(|i| (i.wrapping_mul(7) % 256) as u8)
+        .collect();
     let target = agent.dir.join("fake_partition.img");
     // pre-fill the target with different bytes so the write is meaningful
     std::fs::write(&target, vec![0xAAu8; 6000]).unwrap();
@@ -176,6 +187,79 @@ fn command_flash_dry_run_does_not_write() {
     .unwrap();
     assert!(!report.written);
     assert_eq!(report.sha256, sha256_hex(&image));
+}
+
+// commands::flash_delta — ship only a zstd patch, reconstruct against the on-device base.
+#[test]
+fn command_flash_delta_reconstructs_and_verifies() {
+    let agent = spawn_agent();
+    let master = agent.master.try_clone().unwrap();
+    let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
+    t.ping().unwrap();
+
+    // base ~ new (a few bytes differ), like a dtb tweak between iterations
+    let mut base: Vec<u8> = (0..40_000u32)
+        .map(|i| (i.wrapping_mul(13) % 256) as u8)
+        .collect();
+    let base_path = agent.dir.join("base.img");
+    std::fs::write(&base_path, &base).unwrap();
+    for x in base.iter_mut().skip(20_000).take(200) {
+        *x ^= 0xFF;
+    }
+    let new = base; // now mutated
+    let new_path = agent.dir.join("new.img");
+    std::fs::write(&new_path, &new).unwrap();
+
+    // the "partition" starts out holding exactly the base bytes
+    let target = agent.dir.join("partition.img");
+    std::fs::write(&target, std::fs::read(&base_path).unwrap()).unwrap();
+
+    let rep = commands::flash_delta(
+        &mut t,
+        &base_path,
+        &new_path,
+        target.to_str().unwrap(),
+        false,
+        1024,
+        21,
+        agent.dir.to_str().unwrap(),
+    )
+    .unwrap();
+    assert!(rep.written);
+    assert_eq!(rep.sha256, sha256_hex(&new));
+    // the partition now holds the new image
+    let on_disk = std::fs::read(&target).unwrap();
+    assert_eq!(&on_disk[..new.len()], &new[..]);
+}
+
+#[test]
+fn command_flash_delta_refuses_on_base_mismatch() {
+    let agent = spawn_agent();
+    let master = agent.master.try_clone().unwrap();
+    let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
+    t.ping().unwrap();
+
+    let base: Vec<u8> = (0..2000u32).map(|i| (i % 256) as u8).collect();
+    let base_path = agent.dir.join("b.img");
+    std::fs::write(&base_path, &base).unwrap();
+    let new_path = agent.dir.join("n.img");
+    std::fs::write(&new_path, vec![1u8; 2000]).unwrap();
+
+    // target holds DIFFERENT bytes than base -> must refuse
+    let target = agent.dir.join("p.img");
+    std::fs::write(&target, vec![0x55u8; 2000]).unwrap();
+
+    let err = commands::flash_delta(
+        &mut t,
+        &base_path,
+        &new_path,
+        target.to_str().unwrap(),
+        false,
+        1024,
+        22,
+        agent.dir.to_str().unwrap(),
+    );
+    assert!(err.is_err(), "should refuse when device base mismatches");
 }
 
 // commands::pull a file back into memory.

@@ -98,7 +98,9 @@ impl Reassembler {
     }
 
     pub fn missing(&self) -> Vec<u32> {
-        (0..self.nchunks).filter(|s| !self.got.contains_key(s)).collect()
+        (0..self.nchunks)
+            .filter(|s| !self.got.contains_key(s))
+            .collect()
     }
 
     pub fn is_complete(&self) -> bool {
@@ -183,15 +185,20 @@ mod tests {
         let bad = "!!!!";
         let sum = chunk_sum(bad);
         let mut r = Reassembler::new(1, "x");
-        assert_eq!(r.accept(0, bad, &sum), Err(ChunkError::BadBase64 { seq: 0 }));
+        assert_eq!(
+            r.accept(0, bad, &sum),
+            Err(ChunkError::BadBase64 { seq: 0 })
+        );
     }
 
     #[test]
     fn missing_chunks_reported() {
         let blob = prepare(b"abcdefgh", 2); // 4 chunks
         let mut r = Reassembler::new(blob.nchunks(), blob.sha256);
-        r.accept(0, &blob.chunks[0].b64, &blob.chunks[0].sum).unwrap();
-        r.accept(2, &blob.chunks[2].b64, &blob.chunks[2].sum).unwrap();
+        r.accept(0, &blob.chunks[0].b64, &blob.chunks[0].sum)
+            .unwrap();
+        r.accept(2, &blob.chunks[2].b64, &blob.chunks[2].sum)
+            .unwrap();
         assert_eq!(r.missing(), vec![1, 3]);
         assert!(!r.is_complete());
         assert_eq!(
@@ -209,9 +216,6 @@ mod tests {
         for c in &blob.chunks {
             r.accept(c.seq, &c.b64, &c.sum).unwrap();
         }
-        assert!(matches!(
-            r.finish(),
-            Err(ChunkError::Sha256Mismatch { .. })
-        ));
+        assert!(matches!(r.finish(), Err(ChunkError::Sha256Mismatch { .. })));
     }
 }

@@ -186,11 +186,115 @@ pub fn install_module<L: Link>(
     verify_remote_sha(t, &path, &sha, sudo)?;
 
     if depmod {
-        require_zero(t.exec(&format!("{sp}depmod"), )?, "depmod")?;
+        require_zero(t.exec(&format!("{sp}depmod"))?, "depmod")?;
     } else {
         require_zero(t.exec(&format!("{sp}insmod {}", shq(&path)))?, "insmod")?;
     }
     Ok(())
+}
+
+/// Check that the device has `zstd` available.
+pub fn device_has_zstd<L: Link>(t: &mut Transport<L>) -> Result<bool> {
+    let r = t.exec("command -v zstd >/dev/null 2>&1 && echo yes || echo no")?;
+    Ok(String::from_utf8_lossy(&r.stdout).trim() == "yes")
+}
+
+/// Delta-flash: ship only a zstd patch of (base -> new) and reconstruct on-device against the
+/// current partition content (which must equal `base`). Verifies the device base matches,
+/// reconstructs, sha-checks, dd's, and read-back-verifies. Returns the flash report.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_delta<L: Link>(
+    t: &mut Transport<L>,
+    base_path: &std::path::Path,
+    new_path: &std::path::Path,
+    target: &str,
+    sudo: bool,
+    chunk: usize,
+    xid: u32,
+    device_dir: &str,
+) -> Result<FlashReport> {
+    let base = std::fs::read(base_path).map_err(TransportError::Io)?;
+    let new = std::fs::read(new_path).map_err(TransportError::Io)?;
+    let base_sha = crate::hash::sha256_hex(&base);
+    let new_sha = crate::hash::sha256_hex(&new);
+    let base_len = base.len();
+    let new_len = new.len();
+    let sp = sudo_prefix(sudo);
+
+    if !device_has_zstd(t)? {
+        return Err(TransportError::Protocol(
+            "zstd not found on device (push it, or use a full flash)".into(),
+        ));
+    }
+
+    // The device's current base must match what we diffed against, else reconstruction is garbage.
+    let check = format!(
+        "{sp}sh -c {}",
+        shq(&format!(
+            "head -c {base_len} {dst} | sha256sum | cut -c1-64",
+            dst = shq(target)
+        ))
+    );
+    let r = require_zero(t.exec(&check)?, "read device base")?;
+    let got_base = String::from_utf8_lossy(&r.stdout).trim().to_string();
+    if got_base != base_sha {
+        return Err(TransportError::Verify(format!(
+            "device base sha {got_base} != expected {base_sha}; use a full flash"
+        )));
+    }
+
+    // ship the patch
+    let patch = crate::delta::make_patch(base_path, new_path).map_err(TransportError::Io)?;
+    t.send_blob(xid, &patch, chunk)?;
+    let patch_path = blob_path(device_dir, xid);
+    let base_file = format!("{device_dir}/{xid}.base");
+    let new_file = format!("{device_dir}/{xid}.new");
+
+    // reconstruct against an exact-length copy of the device base, then verify
+    let recon = format!(
+        "{sp}sh -c {}",
+        shq(&format!(
+            "head -c {base_len} {dst} > {bf} && {zstd} && head -c {new_len} {nf} | sha256sum | cut -c1-64",
+            dst = shq(target),
+            bf = shq(&base_file),
+            nf = shq(&new_file),
+            zstd = crate::delta::device_reconstruct_cmd(&base_file, &patch_path, &new_file),
+        ))
+    );
+    let r = require_zero(t.exec(&recon)?, "reconstruct")?;
+    let got_new = String::from_utf8_lossy(&r.stdout).trim().to_string();
+    if got_new != new_sha {
+        return Err(TransportError::Verify(format!(
+            "reconstructed sha {got_new} != new sha {new_sha}"
+        )));
+    }
+
+    // write + read-back verify
+    let write = format!(
+        "{sp}sh -c {}",
+        shq(&format!(
+            "dd if={nf} of={dst} bs=1M 2>/dev/null && sync && head -c {new_len} {dst} | sha256sum | cut -c1-64",
+            nf = shq(&new_file),
+            dst = shq(target),
+        ))
+    );
+    let r = require_zero(t.exec(&write)?, "write + read-back")?;
+    let rb = String::from_utf8_lossy(&r.stdout).trim().to_string();
+    if rb != new_sha {
+        return Err(TransportError::Verify(format!(
+            "read-back sha {rb} != new sha {new_sha} — target may be corrupted"
+        )));
+    }
+
+    // tidy up scratch files
+    let _ = t.exec(&format!("rm -f {} {}", shq(&base_file), shq(&new_file)));
+
+    Ok(FlashReport {
+        sha256: new_sha,
+        bytes: new_len,
+        target: target.to_string(),
+        written: true,
+    })
 }
 
 fn verify_remote_sha<L: Link>(
@@ -200,7 +304,10 @@ fn verify_remote_sha<L: Link>(
     sudo: bool,
 ) -> Result<()> {
     let sp = sudo_prefix(sudo);
-    let cmd = format!("{sp}sh -c {}", shq(&format!("sha256sum {} | cut -c1-64", shq(remote))));
+    let cmd = format!(
+        "{sp}sh -c {}",
+        shq(&format!("sha256sum {} | cut -c1-64", shq(remote)))
+    );
     let r = require_zero(t.exec(&cmd)?, "read-back sha256")?;
     let got = String::from_utf8_lossy(&r.stdout).trim().to_string();
     if got != expected {

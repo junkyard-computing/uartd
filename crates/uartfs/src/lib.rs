@@ -11,6 +11,7 @@
 pub mod chunk;
 pub mod client_link;
 pub mod commands;
+pub mod delta;
 pub mod frame;
 pub mod hash;
 pub mod msg;

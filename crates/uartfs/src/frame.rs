@@ -80,11 +80,7 @@ pub fn parse_line(line: &str) -> Option<Frame> {
     let mut toks = body.split_whitespace();
     let kind = toks.next()?.to_string();
     let args = toks.map(|t| t.to_string()).collect();
-    Some(Frame {
-        dir,
-        kind,
-        args,
-    })
+    Some(Frame { dir, kind, args })
 }
 
 /// Find the rightmost sentinel in a line (printk noise may share the physical line).

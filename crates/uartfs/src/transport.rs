@@ -134,7 +134,11 @@ impl<L: Link> Transport<L> {
 
     /// Wait until a message matching `pred` arrives (removing + returning it), or `deadline`.
     /// Other messages stay queued.
-    fn recv_match<F: Fn(&Msg) -> bool>(&mut self, deadline: Instant, pred: F) -> Result<Option<Msg>> {
+    fn recv_match<F: Fn(&Msg) -> bool>(
+        &mut self,
+        deadline: Instant,
+        pred: F,
+    ) -> Result<Option<Msg>> {
         loop {
             if let Some(i) = self.inbox.iter().position(&pred) {
                 return Ok(self.inbox.remove(i));
@@ -210,8 +214,13 @@ impl<L: Link> Transport<L> {
 
         self.send(&Msg::Close { xid })?;
         let deadline = Instant::now() + self.timeouts.done;
-        match self.recv_match(deadline, |m| matches!(m, Msg::Done { xid: x, .. } if *x == xid))? {
-            Some(Msg::Done { ok: true, sha256, .. }) => {
+        match self.recv_match(
+            deadline,
+            |m| matches!(m, Msg::Done { xid: x, .. } if *x == xid),
+        )? {
+            Some(Msg::Done {
+                ok: true, sha256, ..
+            }) => {
                 if sha256 == blob.sha256 {
                     Ok(blob.sha256)
                 } else {
@@ -221,9 +230,9 @@ impl<L: Link> Transport<L> {
                     )))
                 }
             }
-            Some(Msg::Done { ok: false, .. }) => {
-                Err(TransportError::Verify("device reported transfer failed".into()))
-            }
+            Some(Msg::Done { ok: false, .. }) => Err(TransportError::Verify(
+                "device reported transfer failed".into(),
+            )),
             _ => Err(TransportError::Timeout("no DONE from device".into())),
         }
     }
@@ -248,7 +257,10 @@ impl<L: Link> Transport<L> {
             while i < self.inbox.len() {
                 match &self.inbox[i] {
                     Msg::Out { cid: c, .. } if *c == cid => {
-                        if let Some(Msg::Out { stream, seq, b64, .. }) = self.inbox.remove(i) {
+                        if let Some(Msg::Out {
+                            stream, seq, b64, ..
+                        }) = self.inbox.remove(i)
+                        {
                             if stream == 2 {
                                 err.insert(seq, b64);
                             } else {
@@ -272,7 +284,13 @@ impl<L: Link> Transport<L> {
             std::thread::sleep(self.timeouts.poll);
         };
 
-        let Msg::Exit { code, out_frames, out_sha, .. } = exit else {
+        let Msg::Exit {
+            code,
+            out_frames,
+            out_sha,
+            ..
+        } = exit
+        else {
             unreachable!()
         };
 
@@ -302,7 +320,11 @@ impl<L: Link> Transport<L> {
             )));
         }
 
-        Ok(ExecResult { code, stdout, stderr })
+        Ok(ExecResult {
+            code,
+            stdout,
+            stderr,
+        })
     }
 }
 
@@ -314,8 +336,8 @@ mod tests {
     /// In-memory device: a Rust reimplementation of the phone agent, wired loopback to the
     /// host Transport, with optional fault injection. (The real shell agent is tested in UF4.)
     struct DeviceSim {
-        out: VecDeque<u8>,                 // bytes the host will read
-        reader: FrameReader,               // host->device frames
+        out: VecDeque<u8>,   // bytes the host will read
+        reader: FrameReader, // host->device frames
         transfers: std::collections::HashMap<u32, Xfer>,
         files: std::collections::HashMap<u32, Vec<u8>>, // xid -> reconstructed blob
         // fault injection
@@ -343,11 +365,20 @@ mod tests {
         }
         fn handle(&mut self, m: Msg) {
             match m {
-                Msg::Ping => self.reply(&Msg::Ready { version: "sim1".into() }),
-                Msg::Open { xid, nchunks, sha256, .. } => {
+                Msg::Ping => self.reply(&Msg::Ready {
+                    version: "sim1".into(),
+                }),
+                Msg::Open {
+                    xid,
+                    nchunks,
+                    sha256,
+                    ..
+                } => {
                     self.transfers.insert(
                         xid,
-                        Xfer { re: Reassembler::new(nchunks, sha256) },
+                        Xfer {
+                            re: Reassembler::new(nchunks, sha256),
+                        },
                     );
                 }
                 Msg::Data { xid, seq, b64, sum } => {
@@ -359,7 +390,9 @@ mod tests {
                     } else {
                         (b64, sum)
                     };
-                    let Some(x) = self.transfers.get_mut(&xid) else { return };
+                    let Some(x) = self.transfers.get_mut(&xid) else {
+                        return;
+                    };
                     match x.re.accept(seq, &b64, &sum) {
                         Ok(_) => self.reply(&Msg::Ack { xid, seq }),
                         Err(_) => self.reply(&Msg::Nak { xid, seq }),
@@ -367,16 +400,28 @@ mod tests {
                 }
                 Msg::Close { xid } => {
                     let Some(x) = self.transfers.remove(&xid) else {
-                        self.reply(&Msg::Done { xid, ok: false, sha256: "-".into() });
+                        self.reply(&Msg::Done {
+                            xid,
+                            ok: false,
+                            sha256: "-".into(),
+                        });
                         return;
                     };
                     match x.re.finish() {
                         Ok(bytes) => {
                             let sha = crate::hash::sha256_hex(&bytes);
                             self.files.insert(xid, bytes);
-                            self.reply(&Msg::Done { xid, ok: true, sha256: sha });
+                            self.reply(&Msg::Done {
+                                xid,
+                                ok: true,
+                                sha256: sha,
+                            });
                         }
-                        Err(_) => self.reply(&Msg::Done { xid, ok: false, sha256: "-".into() }),
+                        Err(_) => self.reply(&Msg::Done {
+                            xid,
+                            ok: false,
+                            sha256: "-".into(),
+                        }),
                     }
                 }
                 Msg::Exec { cid, b64cmd } => {

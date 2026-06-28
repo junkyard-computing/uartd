@@ -19,7 +19,10 @@ use uartfs::frame::{Dir, Frame};
 use uartfs::transport::{Link, Transport};
 
 #[derive(Parser)]
-#[command(name = "uartfs", about = "Reliable delta-flash transport over a UART console (rides uartd)")]
+#[command(
+    name = "uartfs",
+    about = "Reliable delta-flash transport over a UART console (rides uartd)"
+)]
 struct Cli {
     /// uartd control socket.
     #[arg(long, global = true, default_value = "/tmp/uartd.sock")]
@@ -51,9 +54,13 @@ enum Cmd {
     /// Read a remote file or `partlabel:offset:len` slice into a local file (`-` for stdout).
     Pull { spec: String, local: String },
     /// Flash an image to a partition by label (delivered, dd'd, read-back-verified).
+    /// With --base, ships only a zstd delta of (base -> image) and reconstructs on-device.
     Flash {
         image: PathBuf,
         partlabel: String,
+        /// Local copy of what's currently on the partition; enables delta flashing.
+        #[arg(long)]
+        base: Option<PathBuf>,
         #[arg(long)]
         dry_run: bool,
         /// Treat <partlabel> as a full device/file path instead of by-partlabel.
@@ -119,9 +126,20 @@ fn run(cli: &Cli) -> i32 {
                 Err(e) => return fail_io(local, e),
             };
             let mut t = transport(cli);
-            match commands::push(&mut t, &data, remote, cli.sudo, cli.chunk, now_id(), &cli.device_dir) {
+            match commands::push(
+                &mut t,
+                &data,
+                remote,
+                cli.sudo,
+                cli.chunk,
+                now_id(),
+                &cli.device_dir,
+            ) {
                 Ok(sha) => {
-                    eprintln!("pushed {} bytes to {remote} (sha256 {sha}) — verified", data.len());
+                    eprintln!(
+                        "pushed {} bytes to {remote} (sha256 {sha}) — verified",
+                        data.len()
+                    );
                     0
                 }
                 Err(e) => fail_transfer(e),
@@ -145,6 +163,7 @@ fn run(cli: &Cli) -> i32 {
         Cmd::Flash {
             image,
             partlabel,
+            base,
             dry_run,
             raw_target,
         } => {
@@ -158,8 +177,45 @@ fn run(cli: &Cli) -> i32 {
                 format!("/dev/disk/by-partlabel/{partlabel}")
             };
             let mut t = transport(cli);
+            // delta path when a base is supplied (and not a dry run)
+            if let Some(base_path) = base {
+                if *dry_run {
+                    eprintln!(
+                        "[dry-run] would delta-flash {} bytes to {target} against base {}",
+                        data.len(),
+                        base_path.display()
+                    );
+                    return 0;
+                }
+                return match commands::flash_delta(
+                    &mut t,
+                    base_path,
+                    image,
+                    &target,
+                    cli.sudo,
+                    cli.chunk,
+                    now_id(),
+                    &cli.device_dir,
+                ) {
+                    Ok(rep) => {
+                        eprintln!(
+                            "delta-flashed {} bytes to {} (sha256 {}) — read-back verified",
+                            rep.bytes, rep.target, rep.sha256
+                        );
+                        0
+                    }
+                    Err(e) => fail_transfer(e),
+                };
+            }
             match commands::flash(
-                &mut t, &data, &target, cli.sudo, cli.chunk, now_id(), &cli.device_dir, *dry_run,
+                &mut t,
+                &data,
+                &target,
+                cli.sudo,
+                cli.chunk,
+                now_id(),
+                &cli.device_dir,
+                *dry_run,
             ) {
                 Ok(rep) if rep.written => {
                     eprintln!(
@@ -189,7 +245,14 @@ fn run(cli: &Cli) -> i32 {
                 .unwrap_or_else(|| "module.ko".into());
             let mut t = transport(cli);
             match commands::install_module(
-                &mut t, &data, &name, cli.sudo, cli.chunk, now_id(), &cli.device_dir, !insmod,
+                &mut t,
+                &data,
+                &name,
+                cli.sudo,
+                cli.chunk,
+                now_id(),
+                &cli.device_dir,
+                !insmod,
             ) {
                 Ok(()) => {
                     eprintln!("installed module {name}");
