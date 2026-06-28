@@ -1,0 +1,36 @@
+# uartd configuration (TOML). Every field is optional; CLI flags and UARTD_* env vars
+# override what is set here. Precedence: defaults < this file < env < flags.
+#
+# Point uartd at this file with `uartd --config uartd.toml` or `UARTD_CONFIG=uartd.toml`.
+
+# Serial port to own. Required (here, or via --port / UARTD_PORT).
+port = "/dev/ttyUSB0"
+
+# Line settings. Defaults: 115200 8N1.
+baud = 115200
+data_bits = 8
+parity = "n"        # n | e | o
+stop_bits = 1
+
+# Control socket the `uart` CLI connects to.
+socket_path = "/tmp/uartd.sock"
+
+# Directory for the append-only forensic log (uartd.log is created inside it).
+log_dir = "/tmp/uartd"
+
+# Max bytes held in the lossy drain buffer before the oldest are dropped (with a marker).
+# The forensic log is never truncated regardless of this.
+buffer_cap = 1048576
+
+# Send pacing (the target UART has no flow control). inter_line_ms is the main knob;
+# inter_char_ms > 0 additionally paces individual characters.
+inter_line_ms = 20
+inter_char_ms = 0
+
+# How long to wait between attempts to (re)open the port after it disappears.
+reconnect_ms = 500
+
+# Optional auto-login. Opt-in: BOTH must be set. On every (re)connect the daemon watches
+# for a `login:` prompt, sends the user, then sends the password at `password:`.
+# login_user = "root"
+# login_pass = "toor"
