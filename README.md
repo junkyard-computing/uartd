@@ -36,12 +36,13 @@ crates/uart-core/   library: drain buffer, line framing, expect matcher, send pa
                     wire protocol, config, daemon, socket client (the reusable core)
 crates/uartd/       the daemon binary
 crates/uart/        the console CLI binary
+crates/uartfs/      reliable delta-flash transport over the console (rides uartd) — see
+                    crates/uartfs/README.md
 ```
 
-Future host tools that ride the same serial line (e.g. `uartfs`, the delta-flash transport)
-land as additional crates here, depending on `uart-core` and co-evolving the wire protocol in
-lockstep — unlike `benchctl`, which only consumes the stable `uart` CLI and lives in its own
-repo.
+uartfs is the first tool that rides the same serial line: it depends on `uart-core`'s socket
+client and co-evolves the framing, so it lives here rather than in its own repo — unlike
+`benchctl`, which only consumes the stable `uart` CLI.
 
 ## Two sinks (don't conflate them)
 

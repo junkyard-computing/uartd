@@ -1,5 +1,5 @@
 {
-  description = "uartd: buffered UART console daemon + CLI for AI-driven serial control";
+  description = "uart tools: buffered UART console daemon (uartd) + delta-flash transport (uartfs)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -21,8 +21,10 @@
           # The integration tests need a pty + the network socket; skip them in the sandbox
           # (they run under `cargo test` / `nix flake check`'s devShell instead).
           doCheck = false;
+          # uartfs shells out to zstd on the host for delta patches.
+          buildInputs = [ pkgs.zstd ];
           meta = {
-            description = "Buffered UART console daemon + CLI for AI-driven serial control";
+            description = "UART console daemon + CLI + delta-flash transport";
             license = pkgs.lib.licenses.asl20;
             mainProgram = "uart";
           };
@@ -44,13 +46,18 @@
           program = "${self.packages.${system}.uartd}/bin/uart";
           meta.description = "uart CLI client for uartd";
         };
+        uartfs = {
+          type = "app";
+          program = "${self.packages.${system}.uartd}/bin/uartfs";
+          meta.description = "uartfs delta-flash transport CLI";
+        };
       });
 
       devShells = forAll (system:
         let pkgs = pkgsFor system;
         in {
           default = pkgs.mkShell {
-            packages = [ pkgs.cargo pkgs.rustc pkgs.rustfmt pkgs.clippy ];
+            packages = [ pkgs.cargo pkgs.rustc pkgs.rustfmt pkgs.clippy pkgs.zstd ];
           };
         });
     };
