@@ -382,8 +382,8 @@ mod tests {
                 Msg::Exec { cid, b64cmd } => {
                     let cmd = String::from_utf8(B64.decode(b64cmd.as_bytes()).unwrap()).unwrap();
                     // the sim "runs" a tiny fixed command vocabulary
-                    let stdout = if cmd.starts_with("echo ") {
-                        format!("{}\n", &cmd[5..]).into_bytes()
+                    let stdout = if let Some(rest) = cmd.strip_prefix("echo ") {
+                        format!("{rest}\n").into_bytes()
                     } else {
                         Vec::new()
                     };

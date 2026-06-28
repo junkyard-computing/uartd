@@ -55,6 +55,10 @@ while IFS= read -r line; do
     PING)
         send "READY 1"
         ;;
+    QUIT)
+        send "BYE"
+        break
+        ;;
     OPEN)
         xid=$1; nchunks=$2; sha=$4
         d="$BASE/$xid"
