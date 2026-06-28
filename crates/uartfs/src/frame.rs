@@ -281,4 +281,100 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].args, vec!["1", "ok", "abcd"]);
     }
+
+    // ---- byte-level fault injection on the wire ----
+
+    #[test]
+    fn reader_rejects_single_byte_garble_in_payload() {
+        // Flip one byte of a real frame's payload (not the checksum): every such corruption
+        // must be rejected by the checksum, never surface as a frame.
+        let good = wire("UFS<", "DATA 1 0 QUJDREVG");
+        let bytes = good.as_bytes();
+        // try corrupting each payload byte position (skip sentinel + the trailing cksum token)
+        let cksum_start = good.rfind(' ').unwrap();
+        for i in "UFS< ".len()..cksum_start {
+            // pick a different printable byte so the line still tokenises
+            let mut b = bytes.to_vec();
+            b[i] = if b[i] == b'X' { b'Y' } else { b'X' };
+            // only meaningful if we actually changed a non-space byte
+            if bytes[i] == b' ' {
+                continue;
+            }
+            let mut r = FrameReader::new();
+            let mut line = b;
+            line.push(b'\n');
+            let frames = r.push(&line);
+            assert!(
+                frames.is_empty(),
+                "corruption at byte {i} was not rejected: {:?}",
+                String::from_utf8_lossy(&line)
+            );
+        }
+    }
+
+    #[test]
+    fn reader_rejects_garbled_checksum() {
+        let good = wire("UFS<", "ACK 9 4");
+        let mut b = good.into_bytes();
+        let last = b.len() - 1;
+        b[last] = if b[last] == b'0' { b'1' } else { b'0' }; // flip a checksum hex digit
+        b.push(b'\n');
+        let mut r = FrameReader::new();
+        assert!(r.push(&b).is_empty());
+    }
+
+    #[test]
+    fn reader_recovers_after_a_corrupt_line() {
+        // a garbled line is dropped, but the following clean frame still parses (resync).
+        let mut r = FrameReader::new();
+        let bad = "UFS< ACK 1 0 deadbeef\n"; // wrong checksum
+        let good = format!("{}\n", wire("UFS<", "ACK 1 1"));
+        let frames = r.push(format!("{bad}{good}").as_bytes());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].args, vec!["1", "1"]);
+    }
+
+    #[test]
+    fn reader_handles_inserted_newline_splitting_a_frame() {
+        // a spurious '\n' inserted mid-frame splits it into two non-frames; both are dropped,
+        // and a following clean frame still parses.
+        let good = wire("UFS<", "DATA 2 5 QUJD");
+        let mid = good.len() / 2;
+        let (a, b) = good.split_at(mid);
+        let next = wire("UFS<", "ACK 2 5");
+        let stream = format!("{a}\n{b}\n{next}\n");
+        let mut r = FrameReader::new();
+        let frames = r.push(stream.as_bytes());
+        assert_eq!(frames.len(), 1, "only the clean trailing frame should parse");
+        assert_eq!(frames[0].kind, "ACK");
+    }
+
+    #[test]
+    fn reader_resyncs_to_last_of_merged_frames() {
+        // Two frames merged onto one line (newline between them lost). Resync to the LAST
+        // sentinel isolates the trailing frame, whose checksum still matches -> it recovers;
+        // the leading frame is discarded. The key safety property is that we never splice the
+        // two into a corrupt-but-accepted message.
+        let a = wire("UFS<", "ACK 1 0");
+        let b = wire("UFS<", "ACK 1 1");
+        let merged = format!("{a} {b}\n");
+        let mut r = FrameReader::new();
+        let frames = r.push(merged.as_bytes());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].args, vec!["1", "1"]);
+    }
+
+    #[test]
+    fn reader_drops_merged_frame_when_tail_is_garbled() {
+        // If the trailing (resynced) frame is itself corrupted, the whole line is dropped —
+        // the leading frame's bytes become body for the failed checksum, so nothing leaks.
+        let a = wire("UFS<", "ACK 1 0");
+        let b = wire("UFS<", "ACK 1 1");
+        let mut merged = format!("{a} {b}").into_bytes();
+        let last = merged.len() - 1;
+        merged[last] ^= 0x01; // garble the tail checksum
+        merged.push(b'\n');
+        let mut r = FrameReader::new();
+        assert!(r.push(&merged).is_empty());
+    }
 }

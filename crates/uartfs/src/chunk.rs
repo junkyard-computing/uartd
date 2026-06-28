@@ -117,6 +117,29 @@ impl Reassembler {
         self.got.len() as u32 == self.nchunks
     }
 
+    /// Like `finish`, but borrows instead of consuming — so a caller (e.g. an idempotent
+    /// CLOSE handler) can reconstruct more than once. Verifies completeness + full sha256.
+    pub fn try_reconstruct(&self) -> Result<Vec<u8>, ChunkError> {
+        let missing = (0..self.nchunks)
+            .filter(|s| !self.got.contains_key(s))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(ChunkError::Incomplete { missing });
+        }
+        let mut out = Vec::new();
+        for seq in 0..self.nchunks {
+            out.extend_from_slice(&self.got[&seq]);
+        }
+        let got = sha256_hex(&out);
+        if got != self.expected_sha {
+            return Err(ChunkError::Sha256Mismatch {
+                expected: self.expected_sha.clone(),
+                got,
+            });
+        }
+        Ok(out)
+    }
+
     /// Concatenate in order and verify the full sha256.
     pub fn finish(self) -> Result<Vec<u8>, ChunkError> {
         let missing = (0..self.nchunks)

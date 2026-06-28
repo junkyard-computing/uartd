@@ -5,6 +5,7 @@
 // here is `Transport<L>`-generic, so it is integration-tested against the real shell agent
 // over a pty (see tests/agent.rs) as well as usable over the live uartd link.
 
+use crate::delta::Codec;
 use crate::transport::{ExecResult, Link, Transport, TransportError};
 
 type Result<T> = std::result::Result<T, TransportError>;
@@ -42,8 +43,9 @@ pub fn run<L: Link>(t: &mut Transport<L>, command: &str) -> Result<ExecResult> {
     t.exec(command)
 }
 
-/// Push a local file to `remote` on the device: deliver (verified), copy into place, then
-/// read-back-verify the destination's sha256 against what was sent.
+/// Push a local file to `remote` on the device: compress, deliver (verified), decompress +
+/// sha-gate on-device, copy into place, then read-back-verify the destination's sha256 against
+/// the original (uncompressed) data. Compression cuts the bytes that cross the slow line.
 #[allow(clippy::too_many_arguments)]
 pub fn push<L: Link>(
     t: &mut Transport<L>,
@@ -54,15 +56,14 @@ pub fn push<L: Link>(
     xid: u32,
     device_dir: &str,
 ) -> Result<String> {
-    let sha = t.send_blob(xid, data, chunk)?;
-    let blob = blob_path(device_dir, xid);
+    let (sha, raw) = deliver_compressed(t, data, sudo, chunk, xid, device_dir)?;
     let sp = sudo_prefix(sudo);
     let cp = format!(
         "{sp}sh -c {}",
         shq(&format!(
             "mkdir -p \"$(dirname {dst})\" && cp {src} {dst}",
             dst = shq(remote),
-            src = shq(&blob)
+            src = shq(&raw)
         ))
     );
     require_zero(t.exec(&cp)?, "copy into place")?;
@@ -117,38 +118,31 @@ pub fn flash<L: Link>(
             written: false,
         });
     }
-    let sha = t.send_blob(xid, image, chunk)?;
-    let blob = blob_path(device_dir, xid);
+    // compress + deliver + decompress + sha-gate (the verified raw file is what we dd)
+    let (sha, raw) = deliver_compressed(t, image, sudo, chunk, xid, device_dir)?;
+    let len = image.len();
     let sp = sudo_prefix(sudo);
-    let write = format!(
-        "{sp}sh -c {}",
-        shq(&format!(
-            "dd if={src} of={dst} bs=1M 2>/dev/null && sync",
-            src = shq(&blob),
-            dst = shq(target)
-        ))
-    );
-    require_zero(t.exec(&write)?, "dd to target")?;
 
-    // read back exactly the written length and compare
-    let readback = format!(
-        "{sp}sh -c {}",
-        shq(&format!(
-            "head -c {len} {dst} | sha256sum | cut -c1-64",
-            len = image.len(),
-            dst = shq(target)
-        ))
-    );
-    let r = require_zero(t.exec(&readback)?, "read-back")?;
-    let got = String::from_utf8_lossy(&r.stdout).trim().to_string();
-    if got != sha {
+    // Write, capturing dd's stderr so we can confirm it actually moved `len` bytes (a short
+    // write — full target, EIO partway — otherwise reads as success here). Then read back
+    // EXACTLY `len` bytes with dd (works on a block device, unlike head -c heuristics) and
+    // compare the sha against the verified image.
+    let write = write_and_readback_cmd(sp, &raw, target, len);
+    let r = require_zero(t.exec(&write)?, "dd to target")?;
+    let (wrote, rbsha) = parse_write_readback(&r.stdout)?;
+    if wrote != len as u64 {
         return Err(TransportError::Verify(format!(
-            "read-back sha {got} != image sha {sha} — target may be corrupted"
+            "dd wrote {wrote} bytes, expected {len} — short write, target may be corrupted"
+        )));
+    }
+    if rbsha != sha {
+        return Err(TransportError::Verify(format!(
+            "read-back sha {rbsha} != image sha {sha} — target may be corrupted"
         )));
     }
     Ok(FlashReport {
         sha256: sha,
-        bytes: image.len(),
+        bytes: len,
         target: target.to_string(),
         written: true,
     })
@@ -167,16 +161,18 @@ pub fn install_module<L: Link>(
     device_dir: &str,
     depmod: bool,
 ) -> Result<()> {
-    let sha = t.send_blob(xid, ko, chunk)?;
-    let blob = blob_path(device_dir, xid);
+    let (sha, raw) = deliver_compressed(t, ko, sudo, chunk, xid, device_dir)?;
     let sp = sudo_prefix(sudo);
 
+    // `name` is quoted with shq like every other interpolated value (it was previously
+    // interpolated raw into the double-quoted "$d/{name}", a shell-injection / breakage hazard
+    // for any module filename with a space or metacharacter).
     let install = format!(
         "{sp}sh -c {}",
         shq(&format!(
-            "d=/lib/modules/$(uname -r)/extra; mkdir -p \"$d\" && cp {src} \"$d/{name}\" && echo \"$d/{name}\"",
-            src = shq(&blob),
-            name = filename,
+            "d=/lib/modules/$(uname -r)/extra; n={name}; mkdir -p \"$d\" && cp {src} \"$d/$n\" && printf '%s\\n' \"$d/$n\"",
+            src = shq(&raw),
+            name = shq(filename),
         ))
     );
     let r = require_zero(t.exec(&install)?, "install module")?;
@@ -197,6 +193,56 @@ pub fn install_module<L: Link>(
 pub fn device_has_zstd<L: Link>(t: &mut Transport<L>) -> Result<bool> {
     let r = t.exec("command -v zstd >/dev/null 2>&1 && echo yes || echo no")?;
     Ok(String::from_utf8_lossy(&r.stdout).trim() == "yes")
+}
+
+/// Pick the best whole-payload codec the device supports: zstd if present, else gzip (always).
+pub fn choose_codec<L: Link>(t: &mut Transport<L>) -> Result<Codec> {
+    if device_has_zstd(t)? {
+        Ok(Codec::Zstd)
+    } else {
+        Ok(Codec::Gzip)
+    }
+}
+
+/// Deliver `data` compressed: pick a codec, ship the compressed bytes into the device temp
+/// file, then decompress on-device to `<blob>.raw` and verify its sha256 == the RAW data's sha
+/// (the sha-gate is on the decompressed image, never the compressed wire bytes). Returns
+/// (raw_sha, raw_path) — the verified, decompressed file the caller then copies or dd's.
+fn deliver_compressed<L: Link>(
+    t: &mut Transport<L>,
+    data: &[u8],
+    sudo: bool,
+    chunk: usize,
+    xid: u32,
+    device_dir: &str,
+) -> Result<(String, String)> {
+    let raw_sha = crate::hash::sha256_hex(data);
+    let codec = choose_codec(t)?;
+    let packed = crate::delta::compress(data, codec).map_err(TransportError::Io)?;
+
+    // ship the COMPRESSED bytes (this is the wire savings)
+    t.send_blob(xid, &packed, chunk)?;
+    let blob = blob_path(device_dir, xid);
+    let raw = format!("{blob}.raw");
+    let sp = sudo_prefix(sudo);
+
+    // decompress on-device, then sha-gate the DECOMPRESSED image before any use
+    let recon = format!(
+        "{sp}sh -c {}",
+        shq(&format!(
+            "{decomp} && sha256sum {raw} | cut -c1-64",
+            decomp = codec.device_decompress_cmd(&blob, &raw),
+            raw = shq(&raw),
+        ))
+    );
+    let r = require_zero(t.exec(&recon)?, "decompress")?;
+    let got = String::from_utf8_lossy(&r.stdout).trim().to_string();
+    if got != raw_sha {
+        return Err(TransportError::Verify(format!(
+            "decompressed sha {got} != expected {raw_sha} — refusing to use payload"
+        )));
+    }
+    Ok((raw_sha, raw))
 }
 
 /// Delta-flash: ship only a zstd patch of (base -> new) and reconstruct on-device against the
@@ -269,17 +315,15 @@ pub fn flash_delta<L: Link>(
         )));
     }
 
-    // write + read-back verify
-    let write = format!(
-        "{sp}sh -c {}",
-        shq(&format!(
-            "dd if={nf} of={dst} bs=1M 2>/dev/null && sync && head -c {new_len} {dst} | sha256sum | cut -c1-64",
-            nf = shq(&new_file),
-            dst = shq(target),
-        ))
-    );
+    // write + read-back verify (robust: verify dd moved new_len bytes, read back exactly that)
+    let write = write_and_readback_cmd(sp, &new_file, target, new_len);
     let r = require_zero(t.exec(&write)?, "write + read-back")?;
-    let rb = String::from_utf8_lossy(&r.stdout).trim().to_string();
+    let (wrote, rb) = parse_write_readback(&r.stdout)?;
+    if wrote != new_len as u64 {
+        return Err(TransportError::Verify(format!(
+            "dd wrote {wrote} bytes, expected {new_len} — short write, target may be corrupted"
+        )));
+    }
     if rb != new_sha {
         return Err(TransportError::Verify(format!(
             "read-back sha {rb} != new sha {new_sha} — target may be corrupted"
@@ -295,6 +339,49 @@ pub fn flash_delta<L: Link>(
         target: target.to_string(),
         written: true,
     })
+}
+
+/// Build the device-side write+read-back command. dd's stderr (which records "N bytes copied")
+/// is parsed so a short write is caught; the read-back uses dd with an exact byte count so it
+/// is correct on a block device (not `head -c`). Emits two stdout lines: `WROTE <n>` and the
+/// read-back sha256.
+fn write_and_readback_cmd(sp: &str, src: &str, dst: &str, len: usize) -> String {
+    // `dd ... 2>&1` captures the "N bytes copied" line; we grep the byte count out of it.
+    // `iflag=count_bytes` lets us read back EXACTLY `len` bytes regardless of block alignment
+    // (coreutils dd on the Debian rootfs supports it; works on block devices unlike head -c).
+    format!(
+        "{sp}sh -c {}",
+        shq(&format!(
+            "w=$(dd if={src} of={dst} bs=1M conv=notrunc 2>&1) && sync && \
+             n=$(printf '%s\\n' \"$w\" | grep -o '[0-9]\\+ bytes' | head -n1 | grep -o '[0-9]\\+') && \
+             printf 'WROTE %s\\n' \"${{n:-0}}\" && \
+             dd if={dst} bs=1M count={len} iflag=count_bytes 2>/dev/null | sha256sum | cut -c1-64",
+            src = shq(src),
+            dst = shq(dst),
+            len = len,
+        ))
+    )
+}
+
+/// Parse the two-line output of `write_and_readback_cmd`: `WROTE <n>\n<sha>`.
+fn parse_write_readback(stdout: &[u8]) -> Result<(u64, String)> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut wrote: Option<u64> = None;
+    let mut sha: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("WROTE ") {
+            wrote = rest.trim().parse().ok();
+        } else if line.len() == 64 && line.bytes().all(|b| b.is_ascii_hexdigit()) {
+            sha = Some(line.to_string());
+        }
+    }
+    match (wrote, sha) {
+        (Some(w), Some(s)) => Ok((w, s)),
+        _ => Err(TransportError::Verify(format!(
+            "could not parse write/read-back output: {text:?}"
+        ))),
+    }
 }
 
 fn verify_remote_sha<L: Link>(
@@ -343,6 +430,67 @@ mod tests {
     #[test]
     fn blob_path_matches_agent_convention() {
         assert_eq!(blob_path(DEFAULT_DEVICE_DIR, 7), "/tmp/uartfs/7/out");
+    }
+
+    #[test]
+    fn parse_write_readback_happy() {
+        let out = b"WROTE 5000\nabc123def4567890abc123def4567890abc123def4567890abc123def4567890\n";
+        let (w, sha) = parse_write_readback(out).unwrap();
+        assert_eq!(w, 5000);
+        assert_eq!(
+            sha,
+            "abc123def4567890abc123def4567890abc123def4567890abc123def4567890"
+        );
+    }
+
+    #[test]
+    fn parse_write_readback_short_write_detected() {
+        // dd reported fewer bytes than expected: the flash code compares this against `len`
+        // and bails. Here we just confirm we parse the (smaller) count out.
+        let out = b"WROTE 100\n0000000000000000000000000000000000000000000000000000000000000000\n";
+        let (w, _sha) = parse_write_readback(out).unwrap();
+        assert_eq!(w, 100);
+    }
+
+    #[test]
+    fn parse_write_readback_missing_fields_errors() {
+        assert!(parse_write_readback(b"WROTE 5\n").is_err()); // no sha line
+        assert!(parse_write_readback(b"garbage\n").is_err());
+    }
+
+    #[test]
+    fn write_readback_cmd_uses_dd_not_head_for_readback() {
+        let cmd = write_and_readback_cmd("", "/tmp/x.raw", "/dev/block/by-name/boot_a", 4096);
+        // read-back must use dd with an exact byte count (correct on block devices),
+        // never `head -c`.
+        assert!(cmd.contains("iflag=count_bytes"));
+        assert!(cmd.contains("count=4096"));
+        assert!(!cmd.contains("head -c"));
+        // and it must verify dd's own byte count
+        assert!(cmd.contains("WROTE"));
+    }
+
+    #[test]
+    fn gzip_codec_roundtrips() {
+        // the device decompress command for gzip must reproduce the original bytes
+        let data: Vec<u8> = (0..2000u32).map(|i| (i % 256) as u8).collect();
+        let packed = crate::delta::compress(&data, Codec::Gzip).unwrap();
+        assert!(packed.len() < data.len(), "should actually compress");
+        let dir = std::env::temp_dir().join(format!("uartfs-gzip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("p.gz");
+        let dst = dir.join("p.raw");
+        std::fs::write(&src, &packed).unwrap();
+        let cmd =
+            Codec::Gzip.device_decompress_cmd(src.to_str().unwrap(), dst.to_str().unwrap());
+        let st = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        assert_eq!(std::fs::read(&dst).unwrap(), data);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

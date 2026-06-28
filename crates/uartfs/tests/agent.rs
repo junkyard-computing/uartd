@@ -168,6 +168,73 @@ fn command_flash_to_file_target_verifies() {
     assert_eq!(&on_disk[..image.len()], &image[..]);
 }
 
+// Block-device-like target: read-back must use an exact dd byte count, not `head -c`. /dev/null
+// accepts the write (dd reports the bytes moved) but reads back as EMPTY, so the sha-gate must
+// catch the mismatch and refuse to claim success — proving the read-back actually re-reads the
+// target rather than trusting the write. (A `head -c {len} /dev/null` reads 0 bytes too, but
+// the point here is that the safety gate fires on a target whose contents differ from the
+// image.) Also exercises the compressed push path end to end (gzip/zstd on PATH).
+#[test]
+fn command_flash_readback_catches_mismatch_on_devnull() {
+    let agent = spawn_agent();
+    let master = agent.master.try_clone().unwrap();
+    let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
+    t.ping().unwrap();
+
+    let image: Vec<u8> = (0..3000u32).map(|i| (i.wrapping_mul(11) % 256) as u8).collect();
+    let err = commands::flash(
+        &mut t,
+        &image,
+        "/dev/null",
+        false,
+        1024,
+        31,
+        agent.dir.to_str().unwrap(),
+        false,
+    );
+    // write "succeeds" (bytes go to /dev/null) but read-back is empty -> sha mismatch -> refuse
+    assert!(
+        matches!(err, Err(uartfs::transport::TransportError::Verify(_))),
+        "expected a read-back verify failure, got {err:?}"
+    );
+}
+
+// Flash to a target that is LONGER than the image (a stand-in for a partition bigger than the
+// payload): the read-back must compare exactly `image.len()` bytes via dd, ignoring the trailing
+// pre-existing bytes. This is the case where head -c vs dd byte-exactness matters.
+#[test]
+fn command_flash_exact_length_readback_on_oversized_target() {
+    let agent = spawn_agent();
+    let master = agent.master.try_clone().unwrap();
+    let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
+    t.ping().unwrap();
+
+    let image: Vec<u8> = (0..4000u32).map(|i| (i.wrapping_mul(9) % 256) as u8).collect();
+    let target = agent.dir.join("oversized.img");
+    // pre-fill with MORE bytes than the image, with a distinct trailing region
+    let mut prefill = vec![0x77u8; 10_000];
+    for (i, b) in prefill.iter_mut().enumerate() {
+        *b = (i % 256) as u8 ^ 0xAA;
+    }
+    std::fs::write(&target, &prefill).unwrap();
+
+    let report = commands::flash(
+        &mut t,
+        &image,
+        target.to_str().unwrap(),
+        false,
+        1024,
+        32,
+        agent.dir.to_str().unwrap(),
+        false,
+    )
+    .unwrap();
+    assert!(report.written);
+    assert_eq!(report.bytes, image.len());
+    let on_disk = std::fs::read(&target).unwrap();
+    assert_eq!(&on_disk[..image.len()], &image[..]);
+}
+
 #[test]
 fn command_flash_dry_run_does_not_write() {
     let agent = spawn_agent();
@@ -332,7 +399,7 @@ fn agent_resumes_after_reboot_keeps_prefix() {
     }
 
     // --- second agent over the SAME dir: resume ---
-    let mut agent2 = spawn_agent_in(dir.clone());
+    let agent2 = spawn_agent_in(dir.clone());
     let master = agent2.master.try_clone().unwrap();
     let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
     t.ping().unwrap();

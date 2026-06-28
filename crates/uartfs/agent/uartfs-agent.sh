@@ -5,14 +5,20 @@
 # the serial console (stdin = host->device frames, stdout = device->host replies). Needs only
 # a POSIX shell + coreutils/busybox basics: base64, sha256sum, dd, wc, tr, cat, mkdir, rm.
 #
-# Protocol (one frame per line):
+# Every wire line ends with a per-frame checksum token (first 8 hex of sha256 over the frame
+# body "KIND arg..."); a line whose checksum doesn't match is rejected (resync), so a garbled
+# or merged frame is never mis-parsed. The agent appends it on send and verifies it on receive.
+#
+# Protocol (one frame per line, trailing <cksum> on each):
 #   host->device:  UFS> PING | OPEN xid n chunksize sha | DATA xid seq b64 sum | CLOSE xid
-#                  UFS> EXEC cid b64cmd
-#   device->host:  UFS< READY v | ACK xid seq | NAK xid seq | DONE xid ok|fail sha
+#                  UFS> STAT xid | EXEC cid b64cmd
+#   device->host:  UFS< READY v | ACK xid seq | NAK xid seq | HAVE xid hw | DONE xid ok|fail sha
 #                  UFS< OUT cid stream seq b64 | EXIT cid code out_frames out_sha
 #
 # A transfer reconstructs a verified blob at $UARTFS_DIR/<xid>/out; apply actions (dd, insmod,
-# decompress, bspatch) are then ordinary EXEC commands that reference that path.
+# decompress, bspatch) are then ordinary EXEC commands that reference that path. Transfers are
+# RESUMABLE: OPEN does not wipe already-received chunks, and STAT reports the contiguous
+# high-water mark (HAVE xid hw) so a host can resume after a device reboot mid-flash.
 
 set -f                                   # no globbing of frame tokens
 BASE="${UARTFS_DIR:-/tmp/uartfs}"

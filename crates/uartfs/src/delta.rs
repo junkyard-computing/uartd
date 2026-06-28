@@ -45,6 +45,55 @@ pub fn device_reconstruct_cmd(base_file: &str, patch_file: &str, new_out: &str) 
     format!("zstd -q -f -d {LONG} --patch-from='{base_file}' '{patch_file}' -o '{new_out}'")
 }
 
+/// Whole-payload compression codec for push/flash. gzip is always on the phone; zstd is
+/// preferred when present (smaller, faster) and pushed/detected by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    Zstd,
+    Gzip,
+}
+
+impl Codec {
+    /// The on-device decompress command: read `src` (compressed), write `dst` (raw).
+    /// Uses only what the agent guarantees (gzip) or what was detected (zstd).
+    pub fn device_decompress_cmd(self, src: &str, dst: &str) -> String {
+        match self {
+            // -q quiet, keep src, write dst
+            Codec::Zstd => format!("zstd -q -f -d '{src}' -o '{dst}'"),
+            Codec::Gzip => format!("gzip -d -c '{src}' > '{dst}'"),
+        }
+    }
+}
+
+/// Compress `data` with `codec`, returning the compressed bytes. Runs the same tool the device
+/// will decompress with, so round-trips are exact.
+pub fn compress(data: &[u8], codec: Codec) -> io::Result<Vec<u8>> {
+    let (prog, args): (&str, &[&str]) = match codec {
+        // -19 is a good size/time tradeoff for a slow line; -c to stdout
+        Codec::Zstd => ("zstd", &["-q", "-f", "-19", "-c"]),
+        Codec::Gzip => ("gzip", &["-9", "-c"]),
+    };
+    let mut child = Command::new(prog)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().ok_or_else(|| io::Error::other("no stdin"))?;
+        stdin.write_all(data)?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "{prog} compress failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(out.stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,29 +20,41 @@ the wire framing and co-evolves with it, so it lives here as a workspace crate s
 ## How it works
 
 - **Framing.** Every message is one ASCII line with a direction sentinel (`UFS>` host→device,
-  `UFS<` device→host). The reader resyncs to the last sentinel on a line (stripping printk that
-  shares it) and ignores everything that isn't a frame, so frames survive console noise, shell
-  echo, and dropped characters. Distinct sentinels mean each side ignores the echo of its own
-  traffic.
+  `UFS<` device→host) and a **trailing per-frame checksum** (first 8 hex of sha256 over the
+  frame body). The reader resyncs to the last sentinel on a line (stripping printk that shares
+  it), **rejects any line whose checksum doesn't match**, and ignores everything that isn't a
+  frame — so a garbled or merged frame is detected and dropped (resync), never mis-parsed as a
+  valid-but-wrong message. Distinct sentinels mean each side ignores the echo of its own traffic.
 - **Reliable delivery.** A blob is split into base64 chunks, each tagged with a sha256 prefix.
-  Transfer is **stop-and-wait ARQ**: every chunk is resent until ACK'd (or NAK'd → resend), and
-  nothing is "delivered" until the device returns a `DONE` whose **full sha256 matches** what was
-  sent. Never trust a byte you didn't checksum.
+  Transfer is **stop-and-wait ARQ**: every chunk is resent until ACK'd (or NAK'd → resend), a
+  dropped ACK keeps retrying rather than aborting, and nothing is "delivered" until the device
+  returns a `DONE` whose **full sha256 matches** what was sent. Never trust a byte you didn't
+  checksum.
+- **Resumable.** Transfers survive a device reboot mid-flash: the agent keeps already-received
+  chunks (keyed by transfer id) and `STAT`→`HAVE` reports the resume point, so a re-run
+  continues from the first missing chunk instead of restarting at chunk 0. If a chunk can't be
+  delivered within the retry bound, the error carries the resume seq.
+- **Compression.** `push`/`flash`/`install-module` compress the payload (zstd when the device
+  has it, else gzip — always present) before chunking, decompress on-device, and **sha-gate the
+  decompressed image** before any write. An 18 MB boot.img no longer crosses the wire raw.
 - **Apply = exec.** Once a verified blob lands in a device temp file, applying it (dd, insmod,
   decompress, patch) is an ordinary verified `exec`. `exec` also powers `pull` (the command's
   stdout *is* the bytes) and `run` (probe the device, get stdout/stderr/exit-code back).
 - **Delta.** `flash --base <current>` ships only a `zstd --patch-from` patch of (base → new) and
   reconstructs on-device against the live partition content, after checking the device's base
   sha matches. Refuses if it doesn't (reconstruction would be garbage).
-- **Safety.** Flashes are read-back-verified: after `dd`, the written region's sha256 must equal
-  the image's, or it's reported as failed — it never claims success on a corrupt write.
+- **Safety.** Flashes are read-back-verified: after `dd` (which is confirmed to have moved the
+  full byte count), the written region — re-read with an exact `dd` byte count, correct on a
+  block device — must sha256-match the image, or it's reported as failed. It never claims
+  success on a short or corrupt write.
 
 ## Phone-side agent
 
 [`agent/uartfs-agent.sh`](agent/uartfs-agent.sh) — a POSIX-shell receiver needing only
-`base64`, `sha256sum`, `dd`, `wc`, `tr`, `cat`. It is **bootstrappable over the bare console**:
-`uartfs bootstrap` pastes it in (base64) and launches it, no prior agent required. Heavier tools
-(`zstd` for delta) are detected; install/push them if missing.
+`base64`, `sha256sum`, `dd`, `wc`, `tr`, `cat`, `gzip`. It is **bootstrappable over the bare
+console**: `uartfs bootstrap` pastes it in (base64) and launches it, no prior agent required.
+`gzip` covers whole-payload compression everywhere; `zstd` (smaller, used for delta and
+preferred for whole-payload) is detected and pushed if missing.
 
 ## Commands
 

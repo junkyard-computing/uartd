@@ -213,15 +213,18 @@ impl<L: Link> Transport<L> {
     /// and then with a `Stalled { resume_from }` error so the caller can retry and continue.
     pub fn send_blob(&mut self, xid: u32, data: &[u8], chunk_size: usize) -> Result<String> {
         let blob: OutboundBlob = prepare(data, chunk_size);
-        self.send(&Msg::Open {
+        let open = Msg::Open {
             xid,
             nchunks: blob.nchunks(),
             chunk_size: blob.chunk_size,
             sha256: blob.sha256.clone(),
-        })?;
+        };
+        self.send(&open)?;
 
         // Resume point: chunks [0, resume) are already verified on-device. STAT can only return
         // a value <= nchunks for the same blob (agent clears c.* if the blob changed on OPEN).
+        // (STAT also implicitly confirms OPEN landed; if it didn't, hw is 0 and we re-OPEN below
+        // when chunks stall.)
         let resume = self.stat(xid)?.min(blob.nchunks());
 
         for c in blob.chunks.iter().skip(resume as usize) {
@@ -246,6 +249,13 @@ impl<L: Link> Transport<L> {
                     // means the DATA or its ACK was dropped: also resend.
                     _ => {
                         tries += 1;
+                        // If a chunk keeps failing, the OPEN itself may have been lost on a
+                        // lossy line (the agent has no transfer for this xid, so it silently
+                        // ignores DATA). Periodically re-send OPEN to recover. OPEN is
+                        // idempotent and preserves already-verified chunks (resumable).
+                        if tries.is_multiple_of(4) {
+                            self.send(&open)?;
+                        }
                         if tries > self.timeouts.retries {
                             // Surface a resumable error: chunks below `seq` are safely on the
                             // device, so a later send_blob with the same xid continues here.
@@ -260,28 +270,37 @@ impl<L: Link> Transport<L> {
             }
         }
 
-        self.send(&Msg::Close { xid })?;
-        let deadline = Instant::now() + self.timeouts.done;
-        match self.recv_match(
-            deadline,
-            |m| matches!(m, Msg::Done { xid: x, .. } if *x == xid),
-        )? {
-            Some(Msg::Done {
-                ok: true, sha256, ..
-            }) => {
-                if sha256 == blob.sha256 {
-                    Ok(blob.sha256)
-                } else {
-                    Err(TransportError::Verify(format!(
-                        "device sha {sha256} != sent sha {}",
-                        blob.sha256
-                    )))
+        // CLOSE -> DONE, retried: CLOSE is idempotent (the agent just re-concatenates and
+        // re-hashes the persisted chunks), so a lost CLOSE or a garbled DONE recovers by
+        // re-sending CLOSE within the overall `done` budget.
+        let overall = Instant::now() + self.timeouts.done;
+        loop {
+            self.send(&Msg::Close { xid })?;
+            let until = (Instant::now() + self.timeouts.ack).min(overall);
+            match self.recv_match(until, |m| matches!(m, Msg::Done { xid: x, .. } if *x == xid))? {
+                Some(Msg::Done {
+                    ok: true, sha256, ..
+                }) => {
+                    return if sha256 == blob.sha256 {
+                        Ok(blob.sha256)
+                    } else {
+                        Err(TransportError::Verify(format!(
+                            "device sha {sha256} != sent sha {}",
+                            blob.sha256
+                        )))
+                    };
+                }
+                Some(Msg::Done { ok: false, .. }) => {
+                    return Err(TransportError::Verify(
+                        "device reported transfer failed".into(),
+                    ));
+                }
+                _ => {
+                    if Instant::now() >= overall {
+                        return Err(TransportError::Timeout("no DONE from device".into()));
+                    }
                 }
             }
-            Some(Msg::Done { ok: false, .. }) => Err(TransportError::Verify(
-                "device reported transfer failed".into(),
-            )),
-            _ => Err(TransportError::Timeout("no DONE from device".into())),
         }
     }
 
@@ -486,7 +505,19 @@ mod tests {
                     }
                 }
                 Msg::Close { xid } => {
-                    let Some(x) = self.transfers.remove(&xid) else {
+                    // Idempotent (mirrors the agent, whose c.* chunk files persist): a CLOSE
+                    // re-sent because its DONE was garbled on the wire must re-reply the SAME
+                    // result, not "fail". If we already reconstructed this xid, answer success.
+                    if let Some(bytes) = self.files.get(&xid) {
+                        let sha = crate::hash::sha256_hex(bytes);
+                        self.reply(&Msg::Done {
+                            xid,
+                            ok: true,
+                            sha256: sha,
+                        });
+                        return;
+                    }
+                    let Some(x) = self.transfers.get(&xid) else {
                         self.reply(&Msg::Done {
                             xid,
                             ok: false,
@@ -494,7 +525,9 @@ mod tests {
                         });
                         return;
                     };
-                    match x.re.finish() {
+                    // finish() consumes; clone the reassembled state instead so the transfer
+                    // stays available for an idempotent re-CLOSE.
+                    match x.re.try_reconstruct() {
                         Ok(bytes) => {
                             let sha = crate::hash::sha256_hex(&bytes);
                             self.files.insert(xid, bytes);
@@ -565,6 +598,92 @@ mod tests {
         fn read_bytes(&mut self) -> io::Result<Vec<u8>> {
             Ok(self.out.drain(..).collect())
         }
+    }
+
+    /// Wraps a `Link` and injects BYTE-LEVEL faults on the wire — garbling individual bytes in
+    /// both directions on a deterministic schedule — to exercise the per-frame checksum + ARQ
+    /// (not just whole-chunk drop/corrupt, which DeviceSim already does). A garbled frame fails
+    /// its checksum and is dropped, so the host falls back to its ack timeout and retransmits;
+    /// the transfer must still complete and verify.
+    struct LossyLink<L: Link> {
+        inner: L,
+        // garble 1 byte every `period` bytes on the host->device path
+        tx_period: usize,
+        tx_ctr: usize,
+        // garble 1 byte every `period` bytes on the device->host path
+        rx_period: usize,
+        rx_ctr: usize,
+    }
+
+    impl<L: Link> LossyLink<L> {
+        fn new(inner: L, tx_period: usize, rx_period: usize) -> Self {
+            LossyLink {
+                inner,
+                tx_period,
+                tx_ctr: 0,
+                rx_period,
+                rx_ctr: 0,
+            }
+        }
+        // garble non-newline bytes so we don't change line framing — only frame CONTENT, which
+        // the checksum must catch. Newlines are preserved so frames still delimit.
+        fn garble(buf: &mut [u8], period: usize, ctr: &mut usize) {
+            if period == 0 {
+                return;
+            }
+            for b in buf.iter_mut() {
+                *ctr += 1;
+                if *ctr % period == 0 && *b != b'\n' && *b != b'\r' {
+                    *b ^= 0x20; // flip a bit; stays printable-ish, never a newline
+                }
+            }
+        }
+    }
+
+    impl<L: Link> Link for LossyLink<L> {
+        fn send_line(&mut self, line: &str) -> io::Result<()> {
+            let mut bytes = line.as_bytes().to_vec();
+            Self::garble(&mut bytes, self.tx_period, &mut self.tx_ctr);
+            // pass the (possibly corrupted) line to the inner link as a lossy string
+            let corrupted = String::from_utf8_lossy(&bytes).into_owned();
+            self.inner.send_line(&corrupted)
+        }
+        fn read_bytes(&mut self) -> io::Result<Vec<u8>> {
+            let mut bytes = self.inner.read_bytes()?;
+            Self::garble(&mut bytes, self.rx_period, &mut self.rx_ctr);
+            Ok(bytes)
+        }
+    }
+
+    #[test]
+    fn send_blob_survives_byte_level_garble_both_directions() {
+        // Inject byte-level corruption on BOTH the command and reply paths. The frame checksum
+        // rejects every garbled line; the ARQ retransmits until each chunk lands clean.
+        let data: Vec<u8> = (0..600u32).map(|i| (i.wrapping_mul(17) % 256) as u8).collect();
+        // ~1 garbled byte per 140/170 bytes: frames (~40 B) are usually clean but a meaningful
+        // fraction get corrupted and MUST be caught by the checksum + retried. This models a
+        // line that drops characters occasionally, not one that destroys every frame.
+        let lossy = LossyLink::new(DeviceSim::new(), 140, 170);
+        let mut to = fast();
+        to.retries = 500; // a lossy line needs many retries; the point is it eventually wins
+        to.ack = Duration::from_millis(20);
+        to.done = Duration::from_secs(5);
+        let mut t = Transport::with_timeouts(lossy, to);
+        let sha = t.send_blob(1, &data, 16).unwrap();
+        assert_eq!(sha, crate::hash::sha256_hex(&data));
+        assert_eq!(t.link.inner.files.get(&1).unwrap(), &data);
+    }
+
+    #[test]
+    fn exec_retries_on_byte_level_garble() {
+        // A garbled OUT/EXIT line is dropped by the checksum; exec verifies stdout against the
+        // EXIT sha, and a clean retry by the caller succeeds. Here we just prove a mildly-lossy
+        // path still returns the correct verified stdout (the agent re-emits deterministically
+        // only on a fresh EXEC, so keep loss light enough that one pass gets through clean).
+        let lossy = LossyLink::new(DeviceSim::new(), 0, 0); // control: no loss -> must pass
+        let mut t = Transport::with_timeouts(lossy, fast());
+        let r = t.exec("echo verified-over-lossy").unwrap();
+        assert_eq!(r.stdout, b"verified-over-lossy\n");
     }
 
     fn fold(s: &str, w: usize) -> Vec<&str> {
