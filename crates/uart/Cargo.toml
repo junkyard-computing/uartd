@@ -1,0 +1,17 @@
+[package]
+name = "uart"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI client for the uartd serial console daemon"
+
+[[bin]]
+name = "uart"
+path = "src/main.rs"
+
+[dependencies]
+uart-core.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true

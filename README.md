@@ -26,6 +26,23 @@ It is the inner-loop transport for autonomous kernel bring-up (see
 The `uart` command surface (`read`/`send`/`wait`/`log` + `--json`) is the language-agnostic
 contract other tools (e.g. a Python `benchctl`) integrate against.
 
+## Repository layout
+
+A Cargo workspace, so tooling that builds *on* this transport lives alongside it and shares
+the core library rather than reimplementing the socket client, wire protocol, and framing:
+
+```
+crates/uart-core/   library: drain buffer, line framing, expect matcher, send pacer,
+                    wire protocol, config, daemon, socket client (the reusable core)
+crates/uartd/       the daemon binary
+crates/uart/        the console CLI binary
+```
+
+Future host tools that ride the same serial line (e.g. `uartfs`, the delta-flash transport)
+land as additional crates here, depending on `uart-core` and co-evolving the wire protocol in
+lockstep — unlike `benchctl`, which only consumes the stable `uart` CLI and lives in its own
+repo.
+
 ## Two sinks (don't conflate them)
 
 1. **Drain buffer** behind `uart read` — the live "what's new since I last looked" feed.

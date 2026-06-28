@@ -1,0 +1,15 @@
+[package]
+name = "uartd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Buffered UART console daemon for AI-driven serial control"
+
+[[bin]]
+name = "uartd"
+path = "src/main.rs"
+
+[dependencies]
+uart-core.workspace = true
+clap.workspace = true
+libc.workspace = true

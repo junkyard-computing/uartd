@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
-use uartd::client::send_request;
-use uartd::config::DEFAULT_SOCKET;
-use uartd::proto::{Request, Response};
+use uart_core::client::send_request;
+use uart_core::config::DEFAULT_SOCKET;
+use uart_core::proto::{Request, Response};
 
 #[derive(Parser)]
 #[command(name = "uart", about = "Client for the uartd serial console daemon")]

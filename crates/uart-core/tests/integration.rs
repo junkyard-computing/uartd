@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use uartd::clock::SystemClock;
-use uartd::config::Config;
-use uartd::daemon::Daemon;
-use uartd::proto::{Request, Response};
+use uart_core::clock::SystemClock;
+use uart_core::config::Config;
+use uart_core::daemon::Daemon;
+use uart_core::proto::{Request, Response};
 
 fn start(cfg: Config) -> Daemon {
     Daemon::start(cfg, Arc::new(SystemClock::new())).expect("daemon start")

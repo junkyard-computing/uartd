@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use uartd::client::send_request;
-use uartd::config::{Config, Parity};
-use uartd::proto::{Request, Response};
+use uart_core::client::send_request;
+use uart_core::config::{Config, Parity};
+use uart_core::proto::{Request, Response};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 

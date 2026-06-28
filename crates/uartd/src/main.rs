@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use uartd::clock::SystemClock;
-use uartd::config::{Parity, PartialConfig, resolve};
-use uartd::daemon::Daemon;
+use uart_core::clock::SystemClock;
+use uart_core::config::{Parity, PartialConfig, resolve};
+use uart_core::daemon::Daemon;
 
 #[derive(Parser)]
 #[command(
