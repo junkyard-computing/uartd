@@ -70,10 +70,10 @@ pub fn req(socket: &std::path::Path, r: Request) -> Response {
 pub fn wait_connected(socket: &std::path::Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(Response::Status { connected, .. }) = send_request(socket, &Request::Status) {
-            if connected {
-                return;
-            }
+        if let Ok(Response::Status { connected, .. }) = send_request(socket, &Request::Status)
+            && connected
+        {
+            return;
         }
         if Instant::now() > deadline {
             panic!("daemon never reported connected within {timeout:?}");
@@ -86,10 +86,10 @@ pub fn wait_connected(socket: &std::path::Path, timeout: Duration) {
 pub fn wait_for_text(socket: &std::path::Path, needle: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Response::Read { text, .. } = req(socket, Request::Peek) {
-            if text.contains(needle) {
-                return text;
-            }
+        if let Response::Read { text, .. } = req(socket, Request::Peek)
+            && text.contains(needle)
+        {
+            return text;
         }
         if Instant::now() > deadline {
             panic!("never saw {needle:?} within {timeout:?}");

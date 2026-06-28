@@ -439,10 +439,10 @@ fn do_expect(
     let (tx, rx) = channel::<Arc<Vec<u8>>>();
     shared.subscribers.lock().unwrap().push(tx);
 
-    if let Some((text, no_newline)) = send_first {
-        if let Err(message) = shared.send_paced(&text, no_newline) {
-            return Response::Error { message };
-        }
+    if let Some((text, no_newline)) = send_first
+        && let Err(message) = shared.send_paced(&text, no_newline)
+    {
+        return Response::Error { message };
     }
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);

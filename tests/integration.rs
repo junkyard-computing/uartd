@@ -200,10 +200,10 @@ fn reconnects_after_port_drop() {
     // daemon should notice disconnection
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
-        if let Response::Status { connected, .. } = req(&socket, Request::Status) {
-            if !connected {
-                break;
-            }
+        if let Response::Status { connected, .. } = req(&socket, Request::Status)
+            && !connected
+        {
+            break;
         }
         assert!(std::time::Instant::now() < deadline, "never disconnected");
         std::thread::sleep(Duration::from_millis(20));
