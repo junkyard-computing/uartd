@@ -8,5 +8,7 @@
 // + transport (pure and testable against a simulated device); the binary is the technician
 // CLI (push/pull/flash/patch/install-module/run/bootstrap).
 
+pub mod chunk;
 pub mod frame;
 pub mod hash;
+pub mod msg;
