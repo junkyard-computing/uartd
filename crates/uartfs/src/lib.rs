@@ -9,6 +9,7 @@
 // CLI (push/pull/flash/patch/install-module/run/bootstrap).
 
 pub mod chunk;
+pub mod commands;
 pub mod frame;
 pub mod hash;
 pub mod msg;

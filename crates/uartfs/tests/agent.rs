@@ -7,6 +7,7 @@ mod common;
 use std::time::Duration;
 
 use common::{PtyLink, spawn_agent};
+use uartfs::commands;
 use uartfs::hash::sha256_hex;
 use uartfs::transport::{Timeouts, Transport};
 
@@ -97,4 +98,98 @@ fn push_then_apply_roundtrip() {
     assert_eq!(r.code, 0);
     assert_eq!(r.stdout, payload);
     assert_eq!(std::fs::read(&dest).unwrap(), payload);
+}
+
+// commands::push — deliver + copy into place + read-back-verify.
+#[test]
+fn command_push_with_readback_verify() {
+    let agent = spawn_agent();
+    let master = agent.master.try_clone().unwrap();
+    let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
+    t.ping().unwrap();
+
+    let data: Vec<u8> = (0..3000u32).map(|i| (i % 256) as u8).collect();
+    let remote = agent.dir.join("pushed.bin");
+    let sha = commands::push(
+        &mut t,
+        &data,
+        remote.to_str().unwrap(),
+        false,
+        1024,
+        11,
+        agent.dir.to_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sha, sha256_hex(&data));
+    assert_eq!(std::fs::read(&remote).unwrap(), data);
+}
+
+// commands::flash to a regular file standing in for a partition; includes read-back verify.
+#[test]
+fn command_flash_to_file_target_verifies() {
+    let agent = spawn_agent();
+    let master = agent.master.try_clone().unwrap();
+    let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
+    t.ping().unwrap();
+
+    let image: Vec<u8> = (0..5000u32).map(|i| (i.wrapping_mul(7) % 256) as u8).collect();
+    let target = agent.dir.join("fake_partition.img");
+    // pre-fill the target with different bytes so the write is meaningful
+    std::fs::write(&target, vec![0xAAu8; 6000]).unwrap();
+
+    let report = commands::flash(
+        &mut t,
+        &image,
+        target.to_str().unwrap(),
+        false,
+        1024,
+        12,
+        agent.dir.to_str().unwrap(),
+        false,
+    )
+    .unwrap();
+    assert!(report.written);
+    assert_eq!(report.sha256, sha256_hex(&image));
+    // the written region matches the image exactly
+    let on_disk = std::fs::read(&target).unwrap();
+    assert_eq!(&on_disk[..image.len()], &image[..]);
+}
+
+#[test]
+fn command_flash_dry_run_does_not_write() {
+    let agent = spawn_agent();
+    let master = agent.master.try_clone().unwrap();
+    let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
+    t.ping().unwrap();
+
+    let image = b"would-be flashed".to_vec();
+    let report = commands::flash(
+        &mut t,
+        &image,
+        "/dev/null-nonexistent",
+        false,
+        64,
+        13,
+        agent.dir.to_str().unwrap(),
+        true,
+    )
+    .unwrap();
+    assert!(!report.written);
+    assert_eq!(report.sha256, sha256_hex(&image));
+}
+
+// commands::pull a file back into memory.
+#[test]
+fn command_pull_file() {
+    let agent = spawn_agent();
+    let master = agent.master.try_clone().unwrap();
+    let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
+    t.ping().unwrap();
+
+    let src = agent.dir.join("source.dat");
+    let content: Vec<u8> = (0..1500u32).map(|i| (i % 256) as u8).collect();
+    std::fs::write(&src, &content).unwrap();
+
+    let got = commands::pull(&mut t, src.to_str().unwrap(), false).unwrap();
+    assert_eq!(got, content);
 }
