@@ -9,4 +9,5 @@
 // Modules are added per TDD milestone (see plan.md).
 pub mod buffer;
 pub mod clock;
+pub mod expect;
 pub mod lines;
