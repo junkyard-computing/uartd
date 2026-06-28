@@ -97,6 +97,16 @@ impl Reassembler {
         Ok(seq)
     }
 
+    /// Number of contiguous chunks held from seq 0 — the resume high-water mark the agent
+    /// reports via HAVE (host resends from here).
+    pub fn contiguous_have(&self) -> u32 {
+        let mut hw = 0u32;
+        while self.got.contains_key(&hw) {
+            hw += 1;
+        }
+        hw
+    }
+
     pub fn missing(&self) -> Vec<u32> {
         (0..self.nchunks)
             .filter(|s| !self.got.contains_key(s))

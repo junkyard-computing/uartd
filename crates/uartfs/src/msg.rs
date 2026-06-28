@@ -2,12 +2,17 @@
 //
 // Typed protocol messages over the frame layer.
 //
-//   host -> device:  PING · OPEN · DATA · CLOSE · EXEC
-//   device -> host:  READY · ACK · NAK · DONE · OUT · EXIT
+//   host -> device:  PING · OPEN · DATA · CLOSE · EXEC · STAT
+//   device -> host:  READY · ACK · NAK · DONE · OUT · EXIT · HAVE
 //
 // A transfer (OPEN/DATA/CLOSE -> ACK/NAK/DONE) moves a verified blob into a device temp file.
 // EXEC runs a shell command and streams stdout/stderr back (OUT) with a verifiable EXIT, which
 // also serves as `pull` (the command's stdout *is* the pulled bytes).
+//
+// Resumability: OPEN does NOT discard chunks already persisted for the same xid. STAT xid asks
+// the agent how many contiguous chunks (from seq 0) it already holds; it answers HAVE xid hw.
+// Because delivery is in-order stop-and-wait, that high-water mark is exactly the resume point,
+// so a transfer interrupted by a device reboot resumes instead of restarting at chunk 0.
 
 use crate::frame::{Dir, Frame};
 
@@ -30,6 +35,10 @@ pub enum Msg {
     Close {
         xid: u32,
     },
+    /// Ask the agent how many contiguous chunks (from seq 0) it already has for `xid`.
+    Stat {
+        xid: u32,
+    },
     Exec {
         cid: u32,
         b64cmd: String,
@@ -45,6 +54,12 @@ pub enum Msg {
     Nak {
         xid: u32,
         seq: u32,
+    },
+    /// Reply to STAT: `hw` = number of contiguous verified chunks held from seq 0 (the resume
+    /// point — host should resend starting at seq `hw`).
+    Have {
+        xid: u32,
+        hw: u32,
     },
     Done {
         xid: u32,
@@ -85,12 +100,14 @@ impl Msg {
                 vec![s(xid), s(seq), b64.clone(), sum.clone()],
             ),
             Msg::Close { xid } => Frame::new(Dir::ToDevice, "CLOSE", vec![s(xid)]),
+            Msg::Stat { xid } => Frame::new(Dir::ToDevice, "STAT", vec![s(xid)]),
             Msg::Exec { cid, b64cmd } => {
                 Frame::new(Dir::ToDevice, "EXEC", vec![s(cid), b64cmd.clone()])
             }
             Msg::Ready { version } => Frame::new(Dir::ToHost, "READY", vec![version.clone()]),
             Msg::Ack { xid, seq } => Frame::new(Dir::ToHost, "ACK", vec![s(xid), s(seq)]),
             Msg::Nak { xid, seq } => Frame::new(Dir::ToHost, "NAK", vec![s(xid), s(seq)]),
+            Msg::Have { xid, hw } => Frame::new(Dir::ToHost, "HAVE", vec![s(xid), s(hw)]),
             Msg::Done { xid, ok, sha256 } => Frame::new(
                 Dir::ToHost,
                 "DONE",
@@ -140,6 +157,7 @@ impl Msg {
                 sum: a.get(3)?.clone(),
             },
             "CLOSE" => Msg::Close { xid: p(a, 0)? },
+            "STAT" => Msg::Stat { xid: p(a, 0)? },
             "EXEC" => Msg::Exec {
                 cid: p(a, 0)?,
                 b64cmd: a.get(1)?.clone(),
@@ -154,6 +172,10 @@ impl Msg {
             "NAK" => Msg::Nak {
                 xid: p(a, 0)?,
                 seq: p(a, 1)?,
+            },
+            "HAVE" => Msg::Have {
+                xid: p(a, 0)?,
+                hw: p(a, 1)?,
             },
             "DONE" => Msg::Done {
                 xid: p(a, 0)?,
@@ -221,6 +243,8 @@ mod tests {
             sum: "deadbeef".into(),
         });
         rt(Msg::Close { xid: 1 });
+        rt(Msg::Stat { xid: 1 });
+        rt(Msg::Have { xid: 1, hw: 3 });
         rt(Msg::Exec {
             cid: 9,
             b64cmd: "ZG1lc2c=".into(),

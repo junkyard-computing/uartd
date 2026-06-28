@@ -9,6 +9,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
@@ -79,12 +80,31 @@ enum Cmd {
     Quit,
 }
 
+/// Monotonic transfer id. Seeded once (per process) from pid+nanos so two `uartfs` invocations
+/// in a tight automated loop don't collide on the same xid, then strictly incremented so
+/// successive transfers within a process never reuse one (the old `subsec_nanos() % 90000`
+/// collided and corrupted device-side transfer state). Kept in the 1..=2^31 range so it stays a
+/// short, whitespace-free wire token.
+static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+
 fn now_id() -> u32 {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(1);
-    (n % 90000) + 1
+    // lazily seed on first use
+    let _ = NEXT_ID.compare_exchange(
+        0,
+        {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(1);
+            let seed = (std::process::id().wrapping_mul(2_654_435_761)) ^ nanos;
+            (seed % 1_000_000_000) + 1
+        },
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    // wrap before 0 (the "unseeded" sentinel) and keep it positive
+    if id == 0 { 1 } else { id & 0x7fff_ffff }
 }
 
 fn transport(cli: &Cli) -> Transport<ClientLink> {

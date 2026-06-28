@@ -56,6 +56,13 @@ impl Drop for Agent {
 
 /// Spawn the agent script attached to a fresh pty; returns the Agent (master side).
 pub fn spawn_agent() -> Agent {
+    let dir = std::env::temp_dir().join(format!("uartfs-test-{}", unique()));
+    spawn_agent_in(dir)
+}
+
+/// Spawn the agent against a specific scratch dir (used to model a device reboot: kill the
+/// agent, then respawn it over the SAME dir so persisted chunks survive for resume).
+pub fn spawn_agent_in(dir: PathBuf) -> Agent {
     let (master, slave_path) = open_pty();
     let slave = OpenOptions::new()
         .read(true)
@@ -63,7 +70,6 @@ pub fn spawn_agent() -> Agent {
         .open(&slave_path)
         .expect("open pty slave");
 
-    let dir = std::env::temp_dir().join(format!("uartfs-test-{}", unique()));
     let agent = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("agent/uartfs-agent.sh");
 
     let child = Command::new("sh")
@@ -76,6 +82,14 @@ pub fn spawn_agent() -> Agent {
         .expect("spawn agent");
 
     Agent { master, dir, child }
+}
+
+impl Agent {
+    /// Kill the running agent process but KEEP its scratch dir (models a device reboot).
+    pub fn kill_keep_dir(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// A Link over the pty master.

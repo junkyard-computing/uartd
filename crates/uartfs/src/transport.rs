@@ -53,6 +53,14 @@ pub enum TransportError {
     Timeout(String),
     Protocol(String),
     Verify(String),
+    /// A chunk could not be delivered within the retry bound. `resume_from` is the seq the
+    /// caller should resume at — the agent keeps verified chunks for `xid`, so re-running
+    /// `send_blob` (after the device is reachable again) continues instead of restarting.
+    Stalled {
+        xid: u32,
+        resume_from: u32,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for TransportError {
@@ -62,6 +70,14 @@ impl std::fmt::Display for TransportError {
             TransportError::Timeout(s) => write!(f, "timeout: {s}"),
             TransportError::Protocol(s) => write!(f, "protocol error: {s}"),
             TransportError::Verify(s) => write!(f, "verification failed: {s}"),
+            TransportError::Stalled {
+                xid,
+                resume_from,
+                detail,
+            } => write!(
+                f,
+                "transfer xid {xid} stalled at chunk {resume_from} (resumable): {detail}"
+            ),
         }
     }
 }
@@ -172,8 +188,29 @@ impl<L: Link> Transport<L> {
         }
     }
 
+    /// Ask the agent how many contiguous chunks it already holds for `xid` (the resume point).
+    /// Returns 0 if the agent doesn't answer (treat as "start from scratch").
+    pub fn stat(&mut self, xid: u32) -> Result<u32> {
+        // a couple of attempts in case STAT or HAVE is dropped
+        for _ in 0..3 {
+            self.send(&Msg::Stat { xid })?;
+            let deadline = Instant::now() + self.timeouts.ack;
+            if let Some(Msg::Have { hw, .. }) =
+                self.recv_match(deadline, |m| matches!(m, Msg::Have { xid: x, .. } if *x == xid))?
+            {
+                return Ok(hw);
+            }
+        }
+        Ok(0)
+    }
+
     /// Reliably deliver `data` into the device-side temp file for `xid`, stop-and-wait with
     /// retransmit, gated on a matching DONE sha256. Returns the blob's sha256 on success.
+    ///
+    /// Resumable: the agent keeps verified chunks across an interrupted OPEN, so this first
+    /// asks STAT for the resume point and only sends from there. A dropped/merged ACK keeps
+    /// retrying the same chunk; only after `retries` consecutive failures does it give up —
+    /// and then with a `Stalled { resume_from }` error so the caller can retry and continue.
     pub fn send_blob(&mut self, xid: u32, data: &[u8], chunk_size: usize) -> Result<String> {
         let blob: OutboundBlob = prepare(data, chunk_size);
         self.send(&Msg::Open {
@@ -183,7 +220,11 @@ impl<L: Link> Transport<L> {
             sha256: blob.sha256.clone(),
         })?;
 
-        for c in &blob.chunks {
+        // Resume point: chunks [0, resume) are already verified on-device. STAT can only return
+        // a value <= nchunks for the same blob (agent clears c.* if the blob changed on OPEN).
+        let resume = self.stat(xid)?.min(blob.nchunks());
+
+        for c in blob.chunks.iter().skip(resume as usize) {
             let seq = c.seq;
             let mut tries = 0u32;
             loop {
@@ -200,12 +241,19 @@ impl<L: Link> Transport<L> {
                 })?;
                 match got {
                     Some(Msg::Ack { .. }) => break,
+                    // A NAK means the chunk arrived corrupt: resend immediately, but charge a
+                    // try so a persistently-corrupting path still terminates. A timeout (None)
+                    // means the DATA or its ACK was dropped: also resend.
                     _ => {
                         tries += 1;
                         if tries > self.timeouts.retries {
-                            return Err(TransportError::Timeout(format!(
-                                "chunk {seq} not acked after {tries} tries"
-                            )));
+                            // Surface a resumable error: chunks below `seq` are safely on the
+                            // device, so a later send_blob with the same xid continues here.
+                            return Err(TransportError::Stalled {
+                                xid,
+                                resume_from: seq,
+                                detail: format!("chunk {seq} not acked after {tries} tries"),
+                            });
                         }
                     }
                 }
@@ -343,10 +391,14 @@ mod tests {
         // fault injection
         drop_data: std::collections::HashSet<u32>, // data seqs to drop once
         corrupt_data: std::collections::HashSet<u32>, // data seqs to corrupt once (bad sum)
+        drop_ack: std::collections::HashSet<u32>,  // seqs to accept but drop the ACK for, once
+        die_after: Option<u32>, // stop replying once seq >= this (simulated reboot)
+        rebooted: bool,         // set true once die_after tripped
     }
 
     struct Xfer {
         re: Reassembler,
+        sha: String,
     }
 
     impl DeviceSim {
@@ -358,6 +410,9 @@ mod tests {
                 files: Default::default(),
                 drop_data: Default::default(),
                 corrupt_data: Default::default(),
+                drop_ack: Default::default(),
+                die_after: None,
+                rebooted: false,
             }
         }
         fn reply(&mut self, m: &Msg) {
@@ -374,16 +429,48 @@ mod tests {
                     sha256,
                     ..
                 } => {
-                    self.transfers.insert(
-                        xid,
-                        Xfer {
-                            re: Reassembler::new(nchunks, sha256),
-                        },
-                    );
+                    // Resumable OPEN: keep an existing transfer for the same xid+sha (mirrors
+                    // the agent not wiping verified chunks); only reset on a new/different blob.
+                    let keep = self
+                        .transfers
+                        .get(&xid)
+                        .map(|x| x.sha == sha256)
+                        .unwrap_or(false);
+                    if !keep {
+                        self.transfers.insert(
+                            xid,
+                            Xfer {
+                                re: Reassembler::new(nchunks, sha256.clone()),
+                                sha: sha256,
+                            },
+                        );
+                    }
+                }
+                Msg::Stat { xid } => {
+                    let hw = self
+                        .transfers
+                        .get(&xid)
+                        .map(|x| x.re.contiguous_have())
+                        .unwrap_or(0);
+                    self.reply(&Msg::Have { xid, hw });
                 }
                 Msg::Data { xid, seq, b64, sum } => {
                     if self.drop_data.remove(&seq) {
                         return; // simulate a lost data frame: no reply
+                    }
+                    if self.drop_ack.remove(&seq) {
+                        // accept+persist the chunk but drop the ACK on the floor: the host must
+                        // retry, and the agent must not double-count or lose the chunk.
+                        if let Some(x) = self.transfers.get_mut(&xid) {
+                            let _ = x.re.accept(seq, &b64, &sum);
+                        }
+                        return;
+                    }
+                    if self.die_after.map(|n| seq >= n).unwrap_or(false) {
+                        // simulate a device reboot mid-transfer: stop replying entirely. The
+                        // already-accepted chunks survive (persisted), so a later resume works.
+                        self.rebooted = true;
+                        return;
                     }
                     let (b64, sum) = if self.corrupt_data.remove(&seq) {
                         ("Y29ycnVwdA==".to_string(), sum) // wrong sum vs payload
@@ -537,6 +624,94 @@ mod tests {
         let mut t = Transport::with_timeouts(sim, fast());
         t.send_blob(1, &data, 8).unwrap();
         assert_eq!(t.link.files.get(&1).unwrap(), &data);
+    }
+
+    #[test]
+    fn send_blob_survives_dropped_ack() {
+        // The agent accepts+persists chunk 3 but its ACK is lost: the host must retry, the
+        // agent must not double-count, and the transfer must still complete.
+        let data = b"a dropped ack must not abort the whole transfer over uart".to_vec();
+        let mut sim = DeviceSim::new();
+        sim.drop_ack.insert(3);
+        let mut t = Transport::with_timeouts(sim, fast());
+        let sha = t.send_blob(1, &data, 8).unwrap();
+        assert_eq!(sha, crate::hash::sha256_hex(&data));
+        assert_eq!(t.link.files.get(&1).unwrap(), &data);
+    }
+
+    #[test]
+    fn send_blob_stalled_error_is_resumable() {
+        // Force a chunk to fail past the retry bound -> Stalled{resume_from} pointing at it.
+        let data: Vec<u8> = (0..200u32).map(|i| (i % 7) as u8).collect();
+        let mut sim = DeviceSim::new();
+        // drop_data only fires once per seq; to exhaust retries, never reply for seq>=2.
+        sim.die_after = Some(2);
+        let mut to = fast();
+        to.retries = 2;
+        let mut t = Transport::with_timeouts(sim, to);
+        match t.send_blob(9, &data, 8) {
+            Err(TransportError::Stalled { resume_from, xid, .. }) => {
+                assert_eq!(xid, 9);
+                assert_eq!(resume_from, 2);
+            }
+            other => panic!("expected Stalled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_blob_resumes_after_mid_transfer_reboot() {
+        // First attempt "reboots" after chunk 2 is persisted; the second attempt (same xid)
+        // must STAT, learn hw=3, and send only the remaining chunks — completing the transfer.
+        let data: Vec<u8> = (0..400u32).map(|i| (i.wrapping_mul(31) % 256) as u8).collect();
+        let mut sim = DeviceSim::new();
+        sim.die_after = Some(3); // accepts 0,1,2 then stops replying
+        let mut to = fast();
+        to.retries = 2;
+        let mut t = Transport::with_timeouts(sim, to);
+
+        // attempt 1: stalls partway, but chunks 0..=2 are now persisted on-device
+        let resume_from = match t.send_blob(5, &data, 8) {
+            Err(TransportError::Stalled { resume_from, .. }) => resume_from,
+            other => panic!("expected Stalled on reboot, got {other:?}"),
+        };
+        assert_eq!(resume_from, 3);
+        assert!(t.link.files.get(&5).is_none(), "transfer not yet finished");
+
+        // device "comes back": clear the reboot fault, then resume with the SAME xid.
+        t.link.die_after = None;
+        t.link.rebooted = false;
+        let sha = t.send_blob(5, &data, 8).unwrap();
+        assert_eq!(sha, crate::hash::sha256_hex(&data));
+        assert_eq!(t.link.files.get(&5).unwrap(), &data);
+    }
+
+    #[test]
+    fn stat_reports_high_water_mark() {
+        // Open + deliver a couple of chunks, then STAT should report the contiguous count.
+        let data: Vec<u8> = (0..40u32).map(|i| i as u8).collect();
+        let mut t = Transport::with_timeouts(DeviceSim::new(), fast());
+        let blob = prepare(&data, 8);
+        t.send(&Msg::Open {
+            xid: 3,
+            nchunks: blob.nchunks(),
+            chunk_size: blob.chunk_size,
+            sha256: blob.sha256.clone(),
+        })
+        .unwrap();
+        for c in blob.chunks.iter().take(2) {
+            t.send(&Msg::Data {
+                xid: 3,
+                seq: c.seq,
+                b64: c.b64.clone(),
+                sum: c.sum.clone(),
+            })
+            .unwrap();
+            // drain the ACK
+            let _ = t.recv_match(Instant::now() + Duration::from_millis(200), |m| {
+                matches!(m, Msg::Ack { .. })
+            });
+        }
+        assert_eq!(t.stat(3).unwrap(), 2);
     }
 
     #[test]

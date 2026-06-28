@@ -82,10 +82,25 @@ while IFS= read -r line; do
     OPEN)
         xid=$1; nchunks=$2; sha=$4
         d="$BASE/$xid"
-        rm -rf "$d" 2>/dev/null
         mkdir -p "$d" 2>/dev/null
+        # Resumability: do NOT wipe an existing transfer dir. If a previous OPEN of the same
+        # xid was interrupted (e.g. a device reboot mid-flash), its verified c.* chunks are
+        # kept so the host can resume. But if this OPEN describes a DIFFERENT blob (sha or
+        # nchunks changed), the old partial is stale garbage — clear it so we don't splice
+        # chunks from two different payloads.
+        if [ -f "$d/.sha" ] && { [ "$(cat "$d/.sha" 2>/dev/null)" != "$sha" ] || [ "$(cat "$d/.n" 2>/dev/null)" != "$nchunks" ]; }; then
+            rm -f "$d"/c.* 2>/dev/null
+        fi
         printf '%s' "$nchunks" > "$d/.n"
         printf '%s' "$sha" > "$d/.sha"
+        ;;
+    STAT)
+        # Report the resume point: count of contiguous verified chunks held from seq 0.
+        xid=$1
+        d="$BASE/$xid"
+        hw=0
+        while [ -f "$d/c.$hw" ]; do hw=$(( hw + 1 )); done
+        send "HAVE $xid $hw"
         ;;
     DATA)
         xid=$1; seq=$2; b64=$3; sum=$4

@@ -6,10 +6,12 @@ mod common;
 
 use std::time::Duration;
 
-use common::{PtyLink, spawn_agent};
+use common::{PtyLink, spawn_agent, spawn_agent_in};
+use uartfs::chunk::prepare;
 use uartfs::commands;
 use uartfs::hash::sha256_hex;
-use uartfs::transport::{Timeouts, Transport};
+use uartfs::msg::Msg;
+use uartfs::transport::{Link, Timeouts, Transport};
 
 fn timeouts() -> Timeouts {
     Timeouts {
@@ -260,6 +262,88 @@ fn command_flash_delta_refuses_on_base_mismatch() {
         agent.dir.to_str().unwrap(),
     );
     assert!(err.is_err(), "should refuse when device base mismatches");
+}
+
+// Resume across a (simulated) device reboot against the REAL shell agent: deliver a prefix of
+// chunks, kill the agent keeping its scratch dir, respawn over the same dir, then send_blob the
+// full blob with the same xid. The agent must NOT have wiped the prefix on the first OPEN, must
+// report it via HAVE on STAT, and the host must resume from there — not restart at chunk 0.
+#[test]
+fn agent_resumes_after_reboot_keeps_prefix() {
+    let dir = std::env::temp_dir().join(format!(
+        "uartfs-resume-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let xid = 77u32;
+    let data: Vec<u8> = (0..4000u32)
+        .map(|i| (i.wrapping_mul(53) % 256) as u8)
+        .collect();
+    let blob = prepare(&data, 256);
+    assert!(blob.nchunks() > 4, "need several chunks for a meaningful prefix");
+
+    // --- first agent: hand-deliver OPEN + the first 3 chunks, then "reboot" ---
+    {
+        let mut agent = spawn_agent_in(dir.clone());
+        let master = agent.master.try_clone().unwrap();
+        let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
+        t.ping().unwrap();
+
+        let mut link = PtyLink::new(agent.master.try_clone().unwrap());
+        link.send_line(
+            &Msg::Open {
+                xid,
+                nchunks: blob.nchunks(),
+                chunk_size: blob.chunk_size,
+                sha256: blob.sha256.clone(),
+            }
+            .to_frame()
+            .encode(),
+        )
+        .unwrap();
+        for c in blob.chunks.iter().take(3) {
+            link.send_line(
+                &Msg::Data {
+                    xid,
+                    seq: c.seq,
+                    b64: c.b64.clone(),
+                    sum: c.sum.clone(),
+                }
+                .to_frame()
+                .encode(),
+            )
+            .unwrap();
+            // wait for the ACK so we know the chunk was persisted before we kill the agent
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let got = t.stat(xid).unwrap_or(0);
+                if got > c.seq || std::time::Instant::now() >= deadline {
+                    assert!(got > c.seq, "chunk {} not persisted before reboot", c.seq);
+                    break;
+                }
+            }
+        }
+        // model a device reboot: agent dies, scratch dir survives
+        agent.kill_keep_dir();
+        std::mem::forget(agent); // don't run Drop (which would delete the dir)
+    }
+
+    // --- second agent over the SAME dir: resume ---
+    let mut agent2 = spawn_agent_in(dir.clone());
+    let master = agent2.master.try_clone().unwrap();
+    let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
+    t.ping().unwrap();
+    // the prefix must have survived the reboot
+    assert_eq!(t.stat(xid).unwrap(), 3, "agent lost the resume prefix");
+
+    let sha = t.send_blob(xid, &data, 256).unwrap();
+    assert_eq!(sha, sha256_hex(&data));
+    let out = std::fs::read(dir.join(format!("{xid}/out"))).unwrap();
+    assert_eq!(out, data);
+    // agent2's Drop cleans the dir
 }
 
 // commands::pull a file back into memory.
