@@ -152,8 +152,12 @@ pub fn resolve(
         data_bits: merged.data_bits.unwrap_or(8),
         parity: merged.parity.unwrap_or(Parity::N),
         stop_bits: merged.stop_bits.unwrap_or(1),
-        socket_path: merged.socket_path.unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET)),
-        log_dir: merged.log_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_DIR)),
+        socket_path: merged
+            .socket_path
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET)),
+        log_dir: merged
+            .log_dir
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_DIR)),
         buffer_cap: merged.buffer_cap.unwrap_or(DEFAULT_BUFFER_CAP),
         inter_line: Duration::from_millis(merged.inter_line_ms.unwrap_or(DEFAULT_INTER_LINE_MS)),
         inter_char: Duration::from_millis(merged.inter_char_ms.unwrap_or(DEFAULT_INTER_CHAR_MS)),
@@ -178,7 +182,12 @@ mod tests {
 
     #[test]
     fn defaults_apply_when_only_port_given() {
-        let c = resolve(PartialConfig::default(), PartialConfig::default(), just_port()).unwrap();
+        let c = resolve(
+            PartialConfig::default(),
+            PartialConfig::default(),
+            just_port(),
+        )
+        .unwrap();
         assert_eq!(c.port, "/dev/ttyUSB0");
         assert_eq!(c.baud, 115200);
         assert_eq!(c.data_bits, 8);
@@ -213,7 +222,10 @@ mod tests {
             baud: Some(38400),
             ..Default::default()
         };
-        assert_eq!(resolve(file.clone(), env.clone(), flags).unwrap().baud, 38400);
+        assert_eq!(
+            resolve(file.clone(), env.clone(), flags).unwrap().baud,
+            38400
+        );
         assert_eq!(
             resolve(file.clone(), env, PartialConfig::default())
                 .unwrap()

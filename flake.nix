@@ -37,10 +37,12 @@
         uartd = {
           type = "app";
           program = "${self.packages.${system}.uartd}/bin/uartd";
+          meta.description = "uartd serial console daemon";
         };
         uart = {
           type = "app";
           program = "${self.packages.${system}.uartd}/bin/uart";
+          meta.description = "uart CLI client for uartd";
         };
       });
 

@@ -40,7 +40,9 @@ fn capture_read_clears_log_retains() {
         Response::Read { text, lines, .. } => {
             assert!(text.contains("hello world"), "got {text:?}");
             assert!(
-                lines.iter().any(|l| l.text == "hello world" && l.wall_ms > 0),
+                lines
+                    .iter()
+                    .any(|l| l.text == "hello world" && l.wall_ms > 0),
                 "expected a timestamped line, got {lines:?}"
             );
         }
@@ -105,10 +107,16 @@ fn send_expect_roundtrip_and_no_drops_on_block() {
     }
 
     let echoed = responder.join().unwrap();
-    assert!(echoed.contains("echo hello"), "daemon should have sent the command");
+    assert!(
+        echoed.contains("echo hello"),
+        "daemon should have sent the command"
+    );
 
     // Now a 20-line block: every line must arrive intact at the device (no dropped chars).
-    let block: String = (0..20).map(|i| format!("line{i:02}")).collect::<Vec<_>>().join("\n");
+    let block: String = (0..20)
+        .map(|i| format!("line{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     req(
         &socket,
         Request::Send {
@@ -121,7 +129,10 @@ fn send_expect_roundtrip_and_no_drops_on_block() {
     let received = drain_master(&mut master, Duration::from_millis(500));
     let received = String::from_utf8_lossy(&received);
     for i in 0..20 {
-        assert!(received.contains(&format!("line{i:02}")), "missing line{i:02} in {received:?}");
+        assert!(
+            received.contains(&format!("line{i:02}")),
+            "missing line{i:02} in {received:?}"
+        );
     }
 
     d.shutdown();
@@ -152,7 +163,9 @@ fn wait_matches_then_times_out() {
     master.flush().unwrap();
 
     match waiter.join().unwrap() {
-        Response::Match { matched, timed_out, .. } => assert!(matched && !timed_out),
+        Response::Match {
+            matched, timed_out, ..
+        } => assert!(matched && !timed_out),
         other => panic!("unexpected: {other:?}"),
     }
 
@@ -164,7 +177,9 @@ fn wait_matches_then_times_out() {
             timeout_ms: 300,
         },
     ) {
-        Response::Match { matched, timed_out, .. } => assert!(!matched && timed_out),
+        Response::Match {
+            matched, timed_out, ..
+        } => assert!(!matched && timed_out),
         other => panic!("unexpected: {other:?}"),
     }
 
@@ -220,8 +235,14 @@ fn reconnects_after_port_drop() {
     assert!(text.contains("after-reconnect"), "got {text:?}");
 
     let log = fs::read_to_string(d.log_path()).unwrap();
-    assert!(log.contains("disconnected"), "log missing disconnect marker: {log}");
-    assert!(log.contains("reconnected"), "log missing reconnect marker: {log}");
+    assert!(
+        log.contains("disconnected"),
+        "log missing disconnect marker: {log}"
+    );
+    assert!(
+        log.contains("reconnected"),
+        "log missing reconnect marker: {log}"
+    );
 
     d.shutdown();
     let _ = fs::remove_file(&link);
@@ -245,13 +266,19 @@ fn auto_login_logs_in_and_rearms() {
     // daemon should send the username
     let sent = drain_master(&mut dev.try_clone().unwrap(), Duration::from_millis(400));
     let sent = String::from_utf8_lossy(&sent);
-    assert!(sent.contains("root"), "expected username sent, got {sent:?}");
+    assert!(
+        sent.contains("root"),
+        "expected username sent, got {sent:?}"
+    );
 
     dev.write_all(b"Password: ").unwrap();
     dev.flush().unwrap();
     let sent2 = drain_master(&mut dev.try_clone().unwrap(), Duration::from_millis(400));
     let sent2 = String::from_utf8_lossy(&sent2);
-    assert!(sent2.contains("toor"), "expected password sent, got {sent2:?}");
+    assert!(
+        sent2.contains("toor"),
+        "expected password sent, got {sent2:?}"
+    );
 
     d.shutdown();
 }

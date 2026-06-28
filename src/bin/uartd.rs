@@ -16,7 +16,10 @@ use uartd::config::{Parity, PartialConfig, resolve};
 use uartd::daemon::Daemon;
 
 #[derive(Parser)]
-#[command(name = "uartd", about = "Buffered UART console daemon for AI-driven serial control")]
+#[command(
+    name = "uartd",
+    about = "Buffered UART console daemon for AI-driven serial control"
+)]
 struct Args {
     /// Serial port path (e.g. /dev/ttyUSB0). Required unless set in config/env.
     #[arg(long)]
@@ -96,7 +99,11 @@ fn flags_from(args: &Args) -> Result<PartialConfig, String> {
 fn run() -> Result<(), String> {
     let args = Args::parse();
 
-    let file = match args.config.clone().or_else(|| std::env::var_os("UARTD_CONFIG").map(PathBuf::from)) {
+    let file = match args
+        .config
+        .clone()
+        .or_else(|| std::env::var_os("UARTD_CONFIG").map(PathBuf::from))
+    {
         Some(path) => {
             let body = std::fs::read_to_string(&path)
                 .map_err(|e| format!("reading config {}: {e}", path.display()))?;

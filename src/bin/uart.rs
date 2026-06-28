@@ -143,9 +143,7 @@ fn render(cli: &Cli, resp: &Response) -> i32 {
             0
         }
         Response::Match {
-            context,
-            timed_out,
-            ..
+            context, timed_out, ..
         } => {
             if cli.json {
                 print_json(resp);
@@ -205,9 +203,10 @@ fn start_daemon(cli: &Cli, sock: &std::path::Path, extra: &[String]) -> i32 {
         return 0;
     }
 
-    let uartd = match std::env::current_exe().ok().and_then(|p| {
-        p.parent().map(|d| d.join("uartd"))
-    }) {
+    let uartd = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("uartd")))
+    {
         Some(p) if p.exists() => p,
         _ => PathBuf::from("uartd"), // fall back to PATH
     };

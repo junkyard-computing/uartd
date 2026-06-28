@@ -121,7 +121,9 @@ impl Shared {
         for step in steps {
             {
                 let mut w = self.writer.lock().unwrap();
-                let port = w.as_mut().ok_or_else(|| "not connected to the port".to_string())?;
+                let port = w
+                    .as_mut()
+                    .ok_or_else(|| "not connected to the port".to_string())?;
                 port.write_all(&step.bytes).map_err(|e| e.to_string())?;
                 port.flush().map_err(|e| e.to_string())?;
             } // release the lock before sleeping so reads keep flowing
@@ -145,7 +147,10 @@ impl Daemon {
     pub fn start(cfg: Config, clock: Arc<dyn Clock>) -> std::io::Result<Daemon> {
         fs::create_dir_all(&cfg.log_dir)?;
         let log_path = cfg.log_dir.join("uartd.log");
-        let mut logf = OpenOptions::new().create(true).append(true).open(&log_path)?;
+        let mut logf = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
         let (mono, wall) = clock.now();
         writeln!(
             logf,
@@ -393,7 +398,12 @@ fn dispatch(shared: &Arc<Shared>, req: Request) -> Response {
                 Ok(()) => Response::Ok,
                 Err(message) => Response::Error { message },
             },
-            Some(pattern) => do_expect(shared, &pattern, timeout_ms.unwrap_or(5000), Some((text, no_newline))),
+            Some(pattern) => do_expect(
+                shared,
+                &pattern,
+                timeout_ms.unwrap_or(5000),
+                Some((text, no_newline)),
+            ),
         },
         Request::Wait {
             pattern,
