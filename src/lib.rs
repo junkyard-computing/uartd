@@ -7,3 +7,4 @@
 // port. The daemon module wires these onto a real port + Unix socket.
 
 // Modules are added per TDD milestone (see plan.md).
+pub mod buffer;
