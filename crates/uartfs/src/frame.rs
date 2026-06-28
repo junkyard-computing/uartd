@@ -11,9 +11,26 @@
 // prefix sharing the line is stripped), and silently ignores anything that isn't a frame.
 // Two distinct sentinels mean each side ignores the echo of its own traffic. Payloads are
 // base64 (no spaces/newlines), so whitespace tokenisation is unambiguous.
+//
+// Per-frame integrity: every wire line carries a trailing checksum token — the first 8 hex
+// chars of sha256 over the frame BODY (`KIND arg1 arg2 ...`, single-space-joined, exactly the
+// text that precedes the checksum). The reader recomputes it and REJECTS any line whose
+// checksum doesn't match, so a garbled/merged line is treated as not-a-frame (resync) instead
+// of reaching `Msg::from_frame` as a valid-but-wrong message. The phone agent computes the
+// same token with `printf '%s' "<body>" | sha256sum | cut -c1-8`.
+
+use crate::hash::sha256_prefix;
 
 pub const MAGIC_TO_DEVICE: &str = "UFS>";
 pub const MAGIC_TO_HOST: &str = "UFS<";
+
+/// Length (hex chars) of the per-frame checksum token.
+pub const CKSUM_LEN: usize = 8;
+
+/// Compute the per-frame checksum over an already-rendered body (`KIND arg1 arg2 ...`).
+pub fn frame_cksum(body: &str) -> String {
+    sha256_prefix(body.as_bytes(), CKSUM_LEN)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
@@ -46,12 +63,10 @@ impl Frame {
         }
     }
 
-    /// Render as a wire line (no trailing newline). Panics if any token contains whitespace,
-    /// which would break tokenisation — callers build tokens from base64/numbers/hex only.
-    pub fn encode(&self) -> String {
-        let mut out = String::from(self.dir.magic());
-        out.push(' ');
-        out.push_str(&self.kind);
+    /// Render the frame BODY (`KIND arg1 arg2 ...`), without sentinel or checksum. This is the
+    /// exact text the checksum is computed over.
+    fn body(&self) -> String {
+        let mut out = String::from(&self.kind);
         for a in &self.args {
             debug_assert!(
                 !a.bytes().any(|b| b == b' ' || b == b'\n' || b == b'\r'),
@@ -63,6 +78,20 @@ impl Frame {
         out
     }
 
+    /// Render as a wire line (no trailing newline): `SENTINEL BODY CKSUM`. Panics if any token
+    /// contains whitespace, which would break tokenisation — callers build tokens from
+    /// base64/numbers/hex only.
+    pub fn encode(&self) -> String {
+        let body = self.body();
+        let cksum = frame_cksum(&body);
+        let mut out = String::from(self.dir.magic());
+        out.push(' ');
+        out.push_str(&body);
+        out.push(' ');
+        out.push_str(&cksum);
+        out
+    }
+
     /// Render as a wire line terminated with `\n`.
     pub fn encode_line(&self) -> String {
         let mut s = self.encode();
@@ -71,15 +100,27 @@ impl Frame {
     }
 }
 
-/// Parse one already-delimited line into a frame, resyncing to the last sentinel. Returns
-/// `None` for console noise / non-frame lines.
+/// Parse one already-delimited line into a frame, resyncing to the last sentinel and verifying
+/// the trailing per-frame checksum. Returns `None` for console noise / non-frame lines AND for
+/// any line whose checksum doesn't match (corruption is rejected, never mis-parsed).
 pub fn parse_line(line: &str) -> Option<Frame> {
     let line = line.trim_end_matches(['\r', '\n']);
     let (dir, start) = last_sentinel(line)?;
-    let body = &line[start + MAGIC_TO_DEVICE.len()..];
-    let mut toks = body.split_whitespace();
-    let kind = toks.next()?.to_string();
-    let args = toks.map(|t| t.to_string()).collect();
+    let after = &line[start + MAGIC_TO_DEVICE.len()..];
+    // tokens = KIND arg1 .. argN CKSUM
+    let mut toks: Vec<&str> = after.split_whitespace().collect();
+    // need at least KIND + CKSUM
+    if toks.len() < 2 {
+        return None;
+    }
+    let cksum = toks.pop()?; // trailing checksum token
+    // recompute over the body (the tokens that remain), single-space-joined
+    let body = toks.join(" ");
+    if frame_cksum(&body) != cksum {
+        return None; // checksum mismatch -> not a (valid) frame; resync
+    }
+    let kind = toks[0].to_string();
+    let args = toks[1..].iter().map(|t| t.to_string()).collect();
     Some(Frame { dir, kind, args })
 }
 
@@ -143,6 +184,11 @@ impl FrameReader {
 mod tests {
     use super::*;
 
+    /// Helper: render `SENTINEL BODY CKSUM` for a hand-written body, with a correct checksum.
+    fn wire(magic: &str, body: &str) -> String {
+        format!("{magic} {body} {}", frame_cksum(body))
+    }
+
     #[test]
     fn encode_parse_roundtrip() {
         let f = Frame::new(
@@ -151,15 +197,38 @@ mod tests {
             vec!["7".into(), "3".into(), "QUJD".into(), "deadbeef".into()],
         );
         let line = f.encode();
-        assert_eq!(line, "UFS> DATA 7 3 QUJD deadbeef");
+        // sentinel + body + an 8-hex checksum token
+        assert!(line.starts_with("UFS> DATA 7 3 QUJD deadbeef "));
+        let cksum = line.rsplit(' ').next().unwrap();
+        assert_eq!(cksum.len(), CKSUM_LEN);
+        assert_eq!(cksum, frame_cksum("DATA 7 3 QUJD deadbeef"));
         assert_eq!(parse_line(&line), Some(f));
     }
 
     #[test]
     fn reply_direction() {
         let f = Frame::new(Dir::ToHost, "ACK", vec!["1".into(), "0".into()]);
-        assert_eq!(f.encode(), "UFS< ACK 1 0");
-        assert_eq!(parse_line("UFS< ACK 1 0").unwrap().dir, Dir::ToHost);
+        let line = wire("UFS<", "ACK 1 0");
+        assert_eq!(f.encode(), line);
+        assert_eq!(parse_line(&line).unwrap().dir, Dir::ToHost);
+    }
+
+    #[test]
+    fn bad_checksum_is_rejected() {
+        // a line that tokenises fine but whose checksum doesn't match the body
+        let bad = "UFS< ACK 1 0 00000000";
+        assert!(parse_line(bad).is_none());
+        // a single-byte corruption of an arg invalidates the (unchanged) checksum
+        let good = wire("UFS<", "ACK 1 0");
+        let cksum = good.rsplit(' ').next().unwrap().to_string();
+        let corrupted = format!("UFS< ACK 1 9 {cksum}"); // 0 -> 9
+        assert!(parse_line(&corrupted).is_none());
+    }
+
+    #[test]
+    fn missing_checksum_token_is_rejected() {
+        // a frame body with no checksum token at all is not accepted
+        assert!(parse_line("UFS< ACK 1 0").is_none());
     }
 
     #[test]
@@ -172,7 +241,8 @@ mod tests {
     #[test]
     fn resyncs_past_printk_prefix_on_same_line() {
         // a printk landed on the same physical line before our frame
-        let f = parse_line("[ 3.21] random: crng init done UFS< ACK 2 5").unwrap();
+        let line = format!("[ 3.21] random: crng init done {}", wire("UFS<", "ACK 2 5"));
+        let f = parse_line(&line).unwrap();
         assert_eq!(f.kind, "ACK");
         assert_eq!(f.args, vec!["2", "5"]);
     }
@@ -180,7 +250,11 @@ mod tests {
     #[test]
     fn reader_extracts_frames_from_noisy_stream() {
         let mut r = FrameReader::new();
-        let stream = "kalm@fold:~$ \nUFS< READY 1\n[ 9.9] foo\nUFS< ACK 1 0\n";
+        let stream = format!(
+            "kalm@fold:~$ \n{}\n[ 9.9] foo\n{}\n",
+            wire("UFS<", "READY 1"),
+            wire("UFS<", "ACK 1 0"),
+        );
         let frames = r.push(stream.as_bytes());
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].kind, "READY");
@@ -190,9 +264,10 @@ mod tests {
     #[test]
     fn reader_buffers_partial_line_across_pushes() {
         let mut r = FrameReader::new();
-        assert!(r.push(b"UFS< AC").is_empty());
-        assert!(r.push(b"K 4").is_empty());
-        let frames = r.push(b" 2\n");
+        let line = wire("UFS<", "ACK 4 2");
+        let (a, b) = line.split_at(7);
+        assert!(r.push(a.as_bytes()).is_empty());
+        let frames = r.push(format!("{b}\n").as_bytes());
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].kind, "ACK");
         assert_eq!(frames[0].args, vec!["4", "2"]);
@@ -201,7 +276,8 @@ mod tests {
     #[test]
     fn reader_handles_crlf() {
         let mut r = FrameReader::new();
-        let frames = r.push(b"UFS< DONE 1 ok abcd\r\n");
+        let line = format!("{}\r\n", wire("UFS<", "DONE 1 ok abcd"));
+        let frames = r.push(line.as_bytes());
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].args, vec!["1", "ok", "abcd"]);
     }

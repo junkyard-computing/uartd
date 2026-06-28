@@ -20,7 +20,12 @@ WRAP=512                                  # OUT payload width (chars)
 mkdir -p "$BASE" 2>/dev/null
 stty -echo 2>/dev/null                    # don't echo host input back onto the line
 
-send() { printf 'UFS< %s\n' "$*"; }
+# cksum <body...> : first 8 hex of sha256 over the body text (the frame's KIND + args,
+# single-space-joined), matching the host's frame_cksum().
+cksum() { printf '%s' "$*" | sha256sum | cut -c1-8; }
+
+# send <body...> : emit one reply frame with a trailing per-frame checksum token.
+send() { _b="$*"; printf 'UFS< %s %s\n' "$_b" "$(cksum "$_b")"; }
 
 # emit_stream <file> <stream> <cid> : print OUT frames to the console, set LAST_NB to the
 # frame count. (Must NOT be called via command substitution — that would swallow the frames.)
@@ -32,7 +37,7 @@ emit_stream() {
     _s=0
     while [ "$_s" -lt "$_nb" ]; do
         _p=$(dd if="$_f.b64" bs="$WRAP" skip="$_s" count=1 2>/dev/null)
-        printf 'UFS< OUT %s %s %s %s\n' "$_cid" "$_stream" "$_s" "$_p"
+        send "OUT $_cid $_stream $_s $_p"
         _s=$(( _s + 1 ))
     done
     LAST_NB=$_nb
@@ -43,11 +48,26 @@ send "READY 1"
 while IFS= read -r line; do
     # resync: ignore anything that isn't a host frame; strip any console prefix on the line
     case "$line" in
-        *"UFS> "*) body=${line##*"UFS> "} ;;
+        *"UFS> "*) rest=${line##*"UFS> "} ;;
         *) continue ;;
     esac
+    # split off the trailing checksum token, verify it over the remaining body. A garbled or
+    # merged line is rejected here (resync) rather than mis-parsed as a valid frame.
     # shellcheck disable=SC2086
-    set -- $body
+    set -- $rest
+    [ "$#" -ge 2 ] || continue          # need at least KIND + CKSUM
+    eval "_ck=\${$#}"                    # last token = checksum
+    _body=${rest%% *}                    # placeholder; rebuilt below without the cksum
+    # rebuild body = all tokens except the last, single-space-joined
+    _body=""; _i=1
+    while [ "$_i" -lt "$#" ]; do
+        eval "_t=\${$_i}"
+        if [ -z "$_body" ]; then _body=$_t; else _body="$_body $_t"; fi
+        _i=$(( _i + 1 ))
+    done
+    [ "$(cksum "$_body")" = "$_ck" ] || continue   # checksum mismatch -> not a frame
+    # shellcheck disable=SC2086
+    set -- $_body
     kind=$1
     shift 2>/dev/null
 

@@ -266,13 +266,15 @@ mod tests {
 
     #[test]
     fn unknown_kind_is_none() {
-        let f = parse_line("UFS> WAT 1 2").unwrap();
+        let line = Frame::new(Dir::ToDevice, "WAT", vec!["1".into(), "2".into()]).encode();
+        let f = parse_line(&line).unwrap();
         assert!(Msg::from_frame(&f).is_none());
     }
 
     #[test]
     fn short_args_is_none() {
-        let f = parse_line("UFS> OPEN 1").unwrap();
+        let line = Frame::new(Dir::ToDevice, "OPEN", vec!["1".into()]).encode();
+        let f = parse_line(&line).unwrap();
         assert!(Msg::from_frame(&f).is_none());
     }
 }
