@@ -149,6 +149,7 @@ fn frontend_attach_interactive_shell() {
     // wait for the startup READY, then start an interactive session
     let mut reader = FrameReader::new();
     send(&mut link, &Msg::Attach { cols: 80, rows: 24 });
+    std::thread::sleep(Duration::from_millis(300)); // let the forkpty'd shell come up
 
     // type a command into the live shell
     send(
