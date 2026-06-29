@@ -17,3 +17,4 @@ pub mod lines;
 pub mod login;
 pub mod pacer;
 pub mod proto;
+pub mod verified;
