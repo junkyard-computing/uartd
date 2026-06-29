@@ -74,6 +74,8 @@ enum Cmd {
         #[arg(long)]
         insmod: bool,
     },
+    /// Attach an interactive session to the device's console front-end (Ctrl-] to detach).
+    Attach,
     /// Install + launch the phone-side agent over the bare console.
     Bootstrap,
     /// Tell the agent to exit (return the console to the shell).
@@ -279,6 +281,19 @@ fn run(cli: &Cli) -> i32 {
                     0
                 }
                 Err(e) => fail_transfer(e),
+            }
+        }
+        Cmd::Attach => {
+            let mut link = ClientLink::new(cli.socket.clone());
+            match uartfs::attach::attach(&mut link) {
+                Ok(code) => {
+                    eprintln!("\r\n[detached]");
+                    code
+                }
+                Err(e) => {
+                    eprintln!("uartfs: attach failed: {e}");
+                    2
+                }
             }
         }
         Cmd::Bootstrap => bootstrap(cli),

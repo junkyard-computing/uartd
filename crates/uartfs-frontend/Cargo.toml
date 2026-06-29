@@ -17,3 +17,4 @@ libc.workspace = true
 
 [dev-dependencies]
 uart-core.workspace = true
+base64.workspace = true

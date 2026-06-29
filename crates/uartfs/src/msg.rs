@@ -43,6 +43,22 @@ pub enum Msg {
         cid: u32,
         b64cmd: String,
     },
+    /// Start an interactive session: forkpty a shell sized cols x rows and bridge it.
+    Attach {
+        cols: u16,
+        rows: u16,
+    },
+    /// Keystrokes (base64) for the attached session's pty stdin.
+    AttachIn {
+        b64: String,
+    },
+    /// Terminal resize for the attached session.
+    Winsize {
+        cols: u16,
+        rows: u16,
+    },
+    /// End the interactive session.
+    Detach,
     // device -> host
     Ready {
         version: String,
@@ -78,6 +94,14 @@ pub enum Msg {
         out_frames: u32,
         out_sha: String,
     },
+    /// Output (base64) from the attached session's pty.
+    AttachOut {
+        b64: String,
+    },
+    /// The attached session's shell exited with `code`.
+    AttachEnd {
+        code: i32,
+    },
 }
 
 impl Msg {
@@ -104,6 +128,14 @@ impl Msg {
             Msg::Exec { cid, b64cmd } => {
                 Frame::new(Dir::ToDevice, "EXEC", vec![s(cid), b64cmd.clone()])
             }
+            Msg::Attach { cols, rows } => {
+                Frame::new(Dir::ToDevice, "ATTACH", vec![s(cols), s(rows)])
+            }
+            Msg::AttachIn { b64 } => Frame::new(Dir::ToDevice, "ATTACHIN", vec![b64.clone()]),
+            Msg::Winsize { cols, rows } => {
+                Frame::new(Dir::ToDevice, "WINSIZE", vec![s(cols), s(rows)])
+            }
+            Msg::Detach => Frame::new(Dir::ToDevice, "DETACH", vec![]),
             Msg::Ready { version } => Frame::new(Dir::ToHost, "READY", vec![version.clone()]),
             Msg::Ack { xid, seq } => Frame::new(Dir::ToHost, "ACK", vec![s(xid), s(seq)]),
             Msg::Nak { xid, seq } => Frame::new(Dir::ToHost, "NAK", vec![s(xid), s(seq)]),
@@ -133,6 +165,8 @@ impl Msg {
                 "EXIT",
                 vec![s(cid), s(code), s(out_frames), out_sha.clone()],
             ),
+            Msg::AttachOut { b64 } => Frame::new(Dir::ToHost, "AOUT", vec![b64.clone()]),
+            Msg::AttachEnd { code } => Frame::new(Dir::ToHost, "AEND", vec![s(code)]),
         }
     }
 
@@ -162,6 +196,18 @@ impl Msg {
                 cid: p(a, 0)?,
                 b64cmd: a.get(1)?.clone(),
             },
+            "ATTACH" => Msg::Attach {
+                cols: p(a, 0)?,
+                rows: p(a, 1)?,
+            },
+            "ATTACHIN" => Msg::AttachIn {
+                b64: a.first()?.clone(),
+            },
+            "WINSIZE" => Msg::Winsize {
+                cols: p(a, 0)?,
+                rows: p(a, 1)?,
+            },
+            "DETACH" => Msg::Detach,
             "READY" => Msg::Ready {
                 version: a.first()?.clone(),
             },
@@ -194,6 +240,10 @@ impl Msg {
                 out_frames: p(a, 2)?,
                 out_sha: a.get(3)?.clone(),
             },
+            "AOUT" => Msg::AttachOut {
+                b64: a.first()?.clone(),
+            },
+            "AEND" => Msg::AttachEnd { code: p(a, 0)? },
             _ => return None,
         })
     }
@@ -249,6 +299,17 @@ mod tests {
             cid: 9,
             b64cmd: "ZG1lc2c=".into(),
         });
+        rt(Msg::Attach { cols: 80, rows: 24 });
+        rt(Msg::AttachIn { b64: "bHMK".into() });
+        rt(Msg::Winsize {
+            cols: 132,
+            rows: 43,
+        });
+        rt(Msg::Detach);
+        rt(Msg::AttachOut {
+            b64: "aGVsbG8=".into(),
+        });
+        rt(Msg::AttachEnd { code: 0 });
         rt(Msg::Ready {
             version: "1".into(),
         });

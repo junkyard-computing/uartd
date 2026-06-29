@@ -11,8 +11,12 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use uartfs::commands;
+use uartfs::frame::{Dir, FrameReader};
 use uartfs::hash::sha256_hex;
+use uartfs::msg::Msg;
 use uartfs::transport::{Link, Timeouts, Transport};
 
 fn open_pty() -> (File, String) {
@@ -23,7 +27,10 @@ fn open_pty() -> (File, String) {
         assert_eq!(libc::unlockpt(m), 0);
         let name = libc::ptsname(m);
         assert!(!name.is_null());
-        (File::from_raw_fd(m), CStr::from_ptr(name).to_string_lossy().into_owned())
+        (
+            File::from_raw_fd(m),
+            CStr::from_ptr(name).to_string_lossy().into_owned(),
+        )
     }
 }
 
@@ -42,7 +49,11 @@ impl Drop for Frontend {
 
 fn spawn_frontend() -> Frontend {
     let (master, slave_path) = open_pty();
-    let slave = OpenOptions::new().read(true).write(true).open(&slave_path).unwrap();
+    let slave = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&slave_path)
+        .unwrap();
     let dir = std::env::temp_dir().join(format!("uartfs-fe-{}", std::process::id()));
     let bin = env!("CARGO_BIN_EXE_uartfs-frontend");
     let child = Command::new(bin)
@@ -129,6 +140,67 @@ fn frontend_blob_transfer() {
     assert_eq!(std::fs::read(fe.dir.join("3/out")).unwrap(), data);
 }
 
+// Interactive attach: drive the forkpty'd shell with raw frames and read its pty output back.
+#[test]
+fn frontend_attach_interactive_shell() {
+    let fe = spawn_frontend();
+    let mut link = PtyLink::new(fe.master.try_clone().unwrap());
+
+    // wait for the startup READY, then start an interactive session
+    let mut reader = FrameReader::new();
+    send(&mut link, &Msg::Attach { cols: 80, rows: 24 });
+
+    // type a command into the live shell
+    send(
+        &mut link,
+        &Msg::AttachIn {
+            b64: B64.encode(b"echo attached-$((6*7))\n"),
+        },
+    );
+
+    // collect AttachOut until we see the computed result (the shell ran it interactively)
+    let out = collect_attach(
+        &mut link,
+        &mut reader,
+        "attached-42",
+        Duration::from_secs(6),
+    );
+    assert!(out.contains("attached-42"), "attach output was: {out:?}");
+
+    // detach cleanly
+    send(&mut link, &Msg::Detach);
+}
+
+fn send(link: &mut PtyLink, m: &Msg) {
+    link.send_line(&m.to_frame().encode()).unwrap();
+}
+
+fn collect_attach(
+    link: &mut PtyLink,
+    reader: &mut FrameReader,
+    needle: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut acc = String::new();
+    while std::time::Instant::now() < deadline {
+        let bytes = link.read_bytes().unwrap();
+        for f in reader.push(&bytes) {
+            if f.dir == Dir::ToHost
+                && let Some(Msg::AttachOut { b64 }) = Msg::from_frame(&f)
+                && let Ok(d) = B64.decode(b64.as_bytes())
+            {
+                acc.push_str(&String::from_utf8_lossy(&d));
+            }
+        }
+        if acc.contains(needle) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    acc
+}
+
 #[test]
 fn frontend_push_command() {
     let fe = spawn_frontend();
@@ -136,7 +208,15 @@ fn frontend_push_command() {
     t.ping().unwrap();
     let data = b"delivered to the compiled front-end".to_vec();
     let remote = fe.dir.join("pushed.bin");
-    commands::push(&mut t, &data, remote.to_str().unwrap(), false, 512, 4, fe.dir.to_str().unwrap())
-        .unwrap();
+    commands::push(
+        &mut t,
+        &data,
+        remote.to_str().unwrap(),
+        false,
+        512,
+        4,
+        fe.dir.to_str().unwrap(),
+    )
+    .unwrap();
     assert_eq!(std::fs::read(&remote).unwrap(), data);
 }

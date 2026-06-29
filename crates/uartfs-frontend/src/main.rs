@@ -11,8 +11,10 @@
 // in a later milestone.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
+use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -66,11 +68,9 @@ impl Frontend {
                 ..
             } => {
                 // keep an existing partial transfer for the same xid (resume); else start fresh
-                self.transfers
-                    .entry(xid)
-                    .or_insert_with(|| Xfer {
-                        re: Reassembler::new(nchunks, sha256),
-                    });
+                self.transfers.entry(xid).or_insert_with(|| Xfer {
+                    re: Reassembler::new(nchunks, sha256),
+                });
             }
             Msg::Data { xid, seq, b64, sum } => {
                 let reply = match self.transfers.get_mut(&xid) {
@@ -83,7 +83,11 @@ impl Frontend {
                 self.reply(&reply);
             }
             Msg::Stat { xid } => {
-                let hw = self.transfers.get(&xid).map(|x| x.re.contiguous_have()).unwrap_or(0);
+                let hw = self
+                    .transfers
+                    .get(&xid)
+                    .map(|x| x.re.contiguous_have())
+                    .unwrap_or(0);
                 self.reply(&Msg::Have { xid, hw });
             }
             Msg::Close { xid } => {
@@ -120,9 +124,89 @@ impl Frontend {
                 self.reply(&reply);
             }
             Msg::Exec { cid, b64cmd } => self.exec(cid, &b64cmd),
-            // device->host messages are never received here
+            // Attach is handled in the main loop (it needs the shared frame reader); everything
+            // else (device->host messages, stray Attach* mid-exec) is ignored here.
             _ => {}
         }
+    }
+
+    /// Interactive session: forkpty a shell and bridge it to the host, framed both ways, until
+    /// the shell exits or the host detaches. `reader` is the shared stdin frame decoder.
+    fn attach(&mut self, cols: u16, rows: u16, reader: &mut FrameReader) {
+        let Some((pid, master)) = fork_shell(cols, rows) else {
+            self.reply(&Msg::AttachEnd { code: -1 });
+            return;
+        };
+
+        let mut fds = [
+            libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: master,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let mut buf = [0u8; 4096];
+        let code: i32;
+
+        loop {
+            unsafe { libc::poll(fds.as_mut_ptr(), 2, 200) };
+
+            // host -> child: stdin frames
+            if fds[0].revents != 0 {
+                let n = read_fd(0, &mut buf);
+                if n <= 0 {
+                    code = -1; // host line closed
+                    unsafe { libc::kill(pid, libc::SIGHUP) };
+                    break;
+                }
+                let mut detached = false;
+                for f in reader.push(&buf[..n as usize]) {
+                    if f.dir == Dir::ToDevice
+                        && let Some(m) = Msg::from_frame(&f)
+                    {
+                        match m {
+                            Msg::AttachIn { b64 } => {
+                                if let Ok(d) = B64.decode(b64.as_bytes()) {
+                                    write_fd_all(master, &d);
+                                }
+                            }
+                            Msg::Winsize { cols, rows } => set_winsize(master, cols, rows),
+                            Msg::Detach => detached = true,
+                            _ => {} // ignore other frames mid-attach
+                        }
+                    }
+                }
+                if detached {
+                    unsafe { libc::kill(pid, libc::SIGHUP) };
+                    code = 0;
+                    break;
+                }
+            }
+
+            // child -> host: pty output
+            if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                let n = read_fd(master, &mut buf);
+                if n <= 0 {
+                    code = reap(pid);
+                    break;
+                }
+                self.reply(&Msg::AttachOut {
+                    b64: B64.encode(&buf[..n as usize]),
+                });
+            }
+        }
+
+        unsafe {
+            libc::close(master);
+            let mut st = 0;
+            libc::waitpid(pid, &mut st, 0);
+        }
+        self.reply(&Msg::AttachEnd { code });
     }
 
     fn exec(&mut self, cid: u32, b64cmd: &str) {
@@ -130,11 +214,7 @@ impl Frontend {
         let cmd = String::from_utf8_lossy(&cmd).into_owned();
         let output = Command::new("sh").arg("-c").arg(&cmd).output();
         let (code, stdout, stderr) = match output {
-            Ok(o) => (
-                o.status.code().unwrap_or(-1),
-                o.stdout,
-                o.stderr,
-            ),
+            Ok(o) => (o.status.code().unwrap_or(-1), o.stdout, o.stderr),
             Err(e) => (127, Vec::new(), e.to_string().into_bytes()),
         };
         let out_frames = self.emit_stream(cid, 1, &stdout);
@@ -170,6 +250,74 @@ impl Frontend {
     }
 }
 
+fn read_fd(fd: RawFd, buf: &mut [u8]) -> isize {
+    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) }
+}
+
+fn write_fd_all(fd: RawFd, mut data: &[u8]) {
+    while !data.is_empty() {
+        let n = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
+        if n <= 0 {
+            break;
+        }
+        data = &data[n as usize..];
+    }
+}
+
+fn set_winsize(fd: RawFd, cols: u16, rows: u16) {
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe {
+        libc::ioctl(fd, libc::TIOCSWINSZ, &ws);
+    }
+}
+
+fn reap(pid: libc::pid_t) -> i32 {
+    let mut st = 0;
+    unsafe { libc::waitpid(pid, &mut st, 0) };
+    if libc::WIFEXITED(st) {
+        libc::WEXITSTATUS(st)
+    } else {
+        -1
+    }
+}
+
+/// forkpty a login shell sized cols x rows; returns (child pid, pty master fd).
+fn fork_shell(cols: u16, rows: u16) -> Option<(libc::pid_t, RawFd)> {
+    let mut master: libc::c_int = 0;
+    let ws = libc::winsize {
+        ws_row: rows.max(1),
+        ws_col: cols.max(1),
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pid =
+        unsafe { libc::forkpty(&raw mut master, std::ptr::null_mut(), std::ptr::null(), &ws) };
+    if pid < 0 {
+        return None;
+    }
+    if pid == 0 {
+        // child: the pty slave is already our stdio. Exec an interactive shell (bash, then sh).
+        exec_shell();
+        unsafe { libc::_exit(127) };
+    }
+    Some((pid, master))
+}
+
+fn exec_shell() {
+    let argi = CString::new("-i").unwrap();
+    for sh in ["/bin/bash", "/bin/sh"] {
+        let prog = CString::new(sh).unwrap();
+        let argv = [prog.as_ptr(), argi.as_ptr(), std::ptr::null()];
+        unsafe { libc::execv(prog.as_ptr(), argv.as_ptr()) };
+        // if execv returns, try the next shell
+    }
+}
+
 fn main() {
     let mut fe = Frontend::new();
     fe.reply(&Msg::Ready {
@@ -177,22 +325,29 @@ fn main() {
     });
 
     let mut reader = FrameReader::new();
-    let mut stdin = std::io::stdin();
     let mut buf = [0u8; 4096];
     loop {
-        match stdin.read(&mut buf) {
-            Ok(0) => break, // EOF: line closed
-            Ok(n) => {
-                for f in reader.push(&buf[..n]) {
-                    if f.dir == Dir::ToDevice
-                        && let Some(m) = Msg::from_frame(&f)
-                    {
-                        fe.handle(m);
-                    }
+        let n = read_fd(0, &mut buf);
+        if n == 0 {
+            break; // EOF: line closed
+        }
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        for f in reader.push(&buf[..n as usize]) {
+            if f.dir == Dir::ToDevice
+                && let Some(m) = Msg::from_frame(&f)
+            {
+                if let Msg::Attach { cols, rows } = m {
+                    fe.attach(cols, rows, &mut reader);
+                } else {
+                    fe.handle(m);
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
         }
     }
 }

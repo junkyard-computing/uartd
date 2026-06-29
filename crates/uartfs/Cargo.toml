@@ -18,6 +18,7 @@ uart-core.workspace = true
 clap.workspace = true
 base64.workspace = true
 sha2.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 libc.workspace = true
