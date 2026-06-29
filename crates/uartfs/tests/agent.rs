@@ -181,7 +181,9 @@ fn command_flash_readback_catches_mismatch_on_devnull() {
     let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
     t.ping().unwrap();
 
-    let image: Vec<u8> = (0..3000u32).map(|i| (i.wrapping_mul(11) % 256) as u8).collect();
+    let image: Vec<u8> = (0..3000u32)
+        .map(|i| (i.wrapping_mul(11) % 256) as u8)
+        .collect();
     let err = commands::flash(
         &mut t,
         &image,
@@ -209,7 +211,9 @@ fn command_flash_exact_length_readback_on_oversized_target() {
     let mut t = Transport::with_timeouts(PtyLink::new(master), timeouts());
     t.ping().unwrap();
 
-    let image: Vec<u8> = (0..4000u32).map(|i| (i.wrapping_mul(9) % 256) as u8).collect();
+    let image: Vec<u8> = (0..4000u32)
+        .map(|i| (i.wrapping_mul(9) % 256) as u8)
+        .collect();
     let target = agent.dir.join("oversized.img");
     // pre-fill with MORE bytes than the image, with a distinct trailing region
     let mut prefill = vec![0x77u8; 10_000];
@@ -350,7 +354,10 @@ fn agent_resumes_after_reboot_keeps_prefix() {
         .map(|i| (i.wrapping_mul(53) % 256) as u8)
         .collect();
     let blob = prepare(&data, 256);
-    assert!(blob.nchunks() > 4, "need several chunks for a meaningful prefix");
+    assert!(
+        blob.nchunks() > 4,
+        "need several chunks for a meaningful prefix"
+    );
 
     // --- first agent: hand-deliver OPEN + the first 3 chunks, then "reboot" ---
     {

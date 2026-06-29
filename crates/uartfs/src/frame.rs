@@ -345,7 +345,11 @@ mod tests {
         let stream = format!("{a}\n{b}\n{next}\n");
         let mut r = FrameReader::new();
         let frames = r.push(stream.as_bytes());
-        assert_eq!(frames.len(), 1, "only the clean trailing frame should parse");
+        assert_eq!(
+            frames.len(),
+            1,
+            "only the clean trailing frame should parse"
+        );
         assert_eq!(frames[0].kind, "ACK");
     }
 

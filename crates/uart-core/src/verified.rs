@@ -193,7 +193,9 @@ pub fn run<C: Console>(c: &mut C, cmd: &str, opts: &RunOpts) -> Result<RunResult
             match parse_result(&buf, &nonce) {
                 // The device's own "command didn't survive" sentinel (sha of the payload
                 // mismatched on-device) — a verified reply, but it means: resend.
-                Parsed::Ok { code, stdout } if code == CMD_CORRUPT_RC && stdout == CMD_CORRUPT_MSG => {
+                Parsed::Ok { code, stdout }
+                    if code == CMD_CORRUPT_RC && stdout == CMD_CORRUPT_MSG =>
+                {
                     last = "command corrupted in transit (device sha mismatch)".into();
                     break;
                 }
@@ -288,10 +290,10 @@ pub fn login<C: Console>(
     let peek = read_for(c, Duration::from_millis(800))?;
     if !peek.contains("login:") {
         // no login prompt showing — maybe already a shell
-        if let Ok(r) = run(c, "true", &quick) {
-            if r.code == 0 {
-                return Ok(());
-            }
+        if let Ok(r) = run(c, "true", &quick)
+            && r.code == 0
+        {
+            return Ok(());
         }
         // nudge a quiet getty and wait for the prompt
         c.send_line("")?;
@@ -397,9 +399,8 @@ mod tests {
                 // device-detected corruption sentinel
                 let b = B64.encode(CMD_CORRUPT_MSG);
                 let sha = sha256_hex(b.as_bytes());
-                self.out.extend(
-                    format!("<<E:{nonce}>>:{CMD_CORRUPT_RC}:{sha}:{b}\n").as_bytes(),
-                );
+                self.out
+                    .extend(format!("<<E:{nonce}>>:{CMD_CORRUPT_RC}:{sha}:{b}\n").as_bytes());
             } else {
                 // success: stdout = the command bytes back
                 let b = B64.encode(&cmd);
@@ -448,7 +449,6 @@ mod tests {
         assert!(run(&mut c, "x", &opts).is_err());
     }
 
-
     #[test]
     fn nonces_are_unique_and_hex16() {
         let a = gen_nonce();
@@ -480,7 +480,10 @@ mod tests {
     #[test]
     fn parses_verified_result() {
         let n = "deadbeefdeadbeef";
-        let buf = format!("noise\n<<S:{n}>>\nhello\n{}", device_end_line(n, 0, b"hello\n"));
+        let buf = format!(
+            "noise\n<<S:{n}>>\nhello\n{}",
+            device_end_line(n, 0, b"hello\n")
+        );
         match parse_result(&buf, n) {
             Parsed::Ok { code, stdout } => {
                 assert_eq!(code, 0);
@@ -504,7 +507,9 @@ mod tests {
         let n = "1111222233334444";
         // valid structure but wrong sha
         let b = B64.encode(b"data");
-        let line = format!("<<E:{n}>>:0:0000000000000000000000000000000000000000000000000000000000000000:{b}\n");
+        let line = format!(
+            "<<E:{n}>>:0:0000000000000000000000000000000000000000000000000000000000000000:{b}\n"
+        );
         assert_eq!(parse_result(&line, n), Parsed::Corrupt);
     }
 

@@ -38,7 +38,11 @@ struct PtyConsole {
 impl PtyConsole {
     fn spawn(cmd: &mut Command) -> Self {
         let (master, slave_path) = open_pty();
-        let slave = OpenOptions::new().read(true).write(true).open(&slave_path).unwrap();
+        let slave = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&slave_path)
+            .unwrap();
         let child = cmd
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())

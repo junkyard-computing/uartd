@@ -81,7 +81,10 @@ pub fn compress(data: &[u8], codec: Codec) -> io::Result<Vec<u8>> {
         .spawn()?;
     {
         use std::io::Write;
-        let mut stdin = child.stdin.take().ok_or_else(|| io::Error::other("no stdin"))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("no stdin"))?;
         stdin.write_all(data)?;
     }
     let out = child.wait_with_output()?;

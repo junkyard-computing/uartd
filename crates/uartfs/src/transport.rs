@@ -195,9 +195,10 @@ impl<L: Link> Transport<L> {
         for _ in 0..3 {
             self.send(&Msg::Stat { xid })?;
             let deadline = Instant::now() + self.timeouts.ack;
-            if let Some(Msg::Have { hw, .. }) =
-                self.recv_match(deadline, |m| matches!(m, Msg::Have { xid: x, .. } if *x == xid))?
-            {
+            if let Some(Msg::Have { hw, .. }) = self.recv_match(
+                deadline,
+                |m| matches!(m, Msg::Have { xid: x, .. } if *x == xid),
+            )? {
                 return Ok(hw);
             }
         }
@@ -277,7 +278,10 @@ impl<L: Link> Transport<L> {
         loop {
             self.send(&Msg::Close { xid })?;
             let until = (Instant::now() + self.timeouts.ack).min(overall);
-            match self.recv_match(until, |m| matches!(m, Msg::Done { xid: x, .. } if *x == xid))? {
+            match self.recv_match(
+                until,
+                |m| matches!(m, Msg::Done { xid: x, .. } if *x == xid),
+            )? {
                 Some(Msg::Done {
                     ok: true, sha256, ..
                 }) => {
@@ -659,7 +663,9 @@ mod tests {
     fn send_blob_survives_byte_level_garble_both_directions() {
         // Inject byte-level corruption on BOTH the command and reply paths. The frame checksum
         // rejects every garbled line; the ARQ retransmits until each chunk lands clean.
-        let data: Vec<u8> = (0..600u32).map(|i| (i.wrapping_mul(17) % 256) as u8).collect();
+        let data: Vec<u8> = (0..600u32)
+            .map(|i| (i.wrapping_mul(17) % 256) as u8)
+            .collect();
         // ~1 garbled byte per 140/170 bytes: frames (~40 B) are usually clean but a meaningful
         // fraction get corrupted and MUST be caught by the checksum + retried. This models a
         // line that drops characters occasionally, not one that destroys every frame.
@@ -769,7 +775,9 @@ mod tests {
         to.retries = 2;
         let mut t = Transport::with_timeouts(sim, to);
         match t.send_blob(9, &data, 8) {
-            Err(TransportError::Stalled { resume_from, xid, .. }) => {
+            Err(TransportError::Stalled {
+                resume_from, xid, ..
+            }) => {
                 assert_eq!(xid, 9);
                 assert_eq!(resume_from, 2);
             }
@@ -781,7 +789,9 @@ mod tests {
     fn send_blob_resumes_after_mid_transfer_reboot() {
         // First attempt "reboots" after chunk 2 is persisted; the second attempt (same xid)
         // must STAT, learn hw=3, and send only the remaining chunks — completing the transfer.
-        let data: Vec<u8> = (0..400u32).map(|i| (i.wrapping_mul(31) % 256) as u8).collect();
+        let data: Vec<u8> = (0..400u32)
+            .map(|i| (i.wrapping_mul(31) % 256) as u8)
+            .collect();
         let mut sim = DeviceSim::new();
         sim.die_after = Some(3); // accepts 0,1,2 then stops replying
         let mut to = fast();

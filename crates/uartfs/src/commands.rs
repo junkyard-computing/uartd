@@ -481,8 +481,7 @@ mod tests {
         let src = dir.join("p.gz");
         let dst = dir.join("p.raw");
         std::fs::write(&src, &packed).unwrap();
-        let cmd =
-            Codec::Gzip.device_decompress_cmd(src.to_str().unwrap(), dst.to_str().unwrap());
+        let cmd = Codec::Gzip.device_decompress_cmd(src.to_str().unwrap(), dst.to_str().unwrap());
         let st = std::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd)

@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 use uart_core::client::send_request;
 use uart_core::config::DEFAULT_SOCKET;
 use uart_core::proto::{Request, Response};
+use uart_core::verified::{self, RunOpts, SocketConsole};
 
 #[derive(Parser)]
 #[command(name = "uart", about = "Client for the uartd serial console daemon")]
@@ -61,6 +62,28 @@ enum Cmd {
     Status,
     /// Print the path to the forensic log file.
     Log,
+    /// Run a command on the device's bare shell, device-verified (agentless, reliable).
+    /// Ignores echo; the command carries its own checksum and the reply is checksum-verified.
+    Run {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+        /// Per-attempt timeout in seconds (default 10).
+        #[arg(long)]
+        timeout: Option<f64>,
+        /// Retry count on corruption/timeout (default 4).
+        #[arg(long)]
+        retries: Option<u32>,
+    },
+    /// Log in over a getty (echo-verified user, blind password, confirmed by a verified run).
+    /// Idempotent: a no-op if a shell is already present.
+    Login {
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        timeout: Option<f64>,
+    },
     /// Launch the daemon detached. Extra args are forwarded to uartd.
     Start {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -92,6 +115,22 @@ fn run(cli: &Cli) -> i32 {
     if let Cmd::Start { args } = &cli.cmd {
         return start_daemon(cli, &sock, args);
     }
+    if let Cmd::Run {
+        command,
+        timeout,
+        retries,
+    } = &cli.cmd
+    {
+        return run_verified(cli, &sock, command, *timeout, *retries);
+    }
+    if let Cmd::Login {
+        user,
+        password,
+        timeout,
+    } = &cli.cmd
+    {
+        return login_verified(cli, &sock, user, password, *timeout);
+    }
 
     let request = match &cli.cmd {
         Cmd::Read => Request::Read,
@@ -114,7 +153,7 @@ fn run(cli: &Cli) -> i32 {
         Cmd::Status => Request::Status,
         Cmd::Log => Request::Log,
         Cmd::Stop => Request::Stop,
-        Cmd::Start { .. } => unreachable!(),
+        Cmd::Start { .. } | Cmd::Run { .. } | Cmd::Login { .. } => unreachable!(),
     };
 
     let resp = match send_request(&sock, &request) {
@@ -190,6 +229,66 @@ fn render(cli: &Cli, resp: &Response) -> i32 {
             } else {
                 eprintln!("uart: {message}");
             }
+            3
+        }
+    }
+}
+
+/// `uart run`: device-self-verified command execution over the daemon socket.
+fn run_verified(
+    _cli: &Cli,
+    sock: &std::path::Path,
+    command: &[String],
+    timeout: Option<f64>,
+    retries: Option<u32>,
+) -> i32 {
+    let mut console = SocketConsole::new(sock.to_path_buf());
+    let opts = RunOpts {
+        timeout: Duration::from_secs_f64(timeout.unwrap_or(10.0)),
+        retries: retries.unwrap_or(4),
+        ..RunOpts::default()
+    };
+    match verified::run(&mut console, &command.join(" "), &opts) {
+        Ok(r) => {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&r.stdout);
+            r.code
+        }
+        Err(verified::RunError::Io(e)) => {
+            eprintln!("uart: {e}");
+            2
+        }
+        Err(e) => {
+            eprintln!("uart run: {e}");
+            3
+        }
+    }
+}
+
+/// `uart login`: agentless getty login (echo-verified user, blind password, confirmed run).
+fn login_verified(
+    _cli: &Cli,
+    sock: &std::path::Path,
+    user: &str,
+    password: &str,
+    timeout: Option<f64>,
+) -> i32 {
+    let mut console = SocketConsole::new(sock.to_path_buf());
+    let opts = RunOpts {
+        timeout: Duration::from_secs_f64(timeout.unwrap_or(20.0)),
+        ..RunOpts::default()
+    };
+    match verified::login(&mut console, user, password, &opts) {
+        Ok(()) => {
+            eprintln!("uart: logged in as {user}");
+            0
+        }
+        Err(verified::LoginError::Io(e)) => {
+            eprintln!("uart: {e}");
+            2
+        }
+        Err(e) => {
+            eprintln!("uart login: {e}");
             3
         }
     }
