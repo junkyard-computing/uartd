@@ -1,0 +1,35 @@
+# uartfs console front-end as the owner of a serial line (felix: ttySAC0).
+#
+#   systemctl disable --now serial-getty@ttySAC0.service
+#   systemctl enable  --now uartfs-console@ttySAC0.service
+#
+# The front-end IS the console: it frames+checksums every byte on the line. On failure it falls
+# back to a normal serial-getty so the agentless floor (uart run, see uartd-reliable-run) can
+# still reach the device and reinstall/relaunch this service.
+
+[Unit]
+Description=uartfs framed console front-end on %I
+# Don't let a getty fight us for the line while we're up.
+Conflicts=serial-getty@%i.service
+# If we die for good, hand the line back to a getty so the floor can recover us.
+OnFailure=serial-getty@%i.service
+After=systemd-user-sessions.service
+
+[Service]
+ExecStart=/usr/local/bin/uartfs-frontend
+# Bind our stdin/stdout to the serial line, exactly as serial-getty does.
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/%I
+TTYReset=yes
+TTYVHangup=yes
+# Respawn across transient failures; OnFailure (getty) only triggers when respawn gives up.
+Restart=always
+RestartSec=1
+StartLimitIntervalSec=30
+StartLimitBurst=5
+UtmpIdentifier=%I
+
+[Install]
+WantedBy=multi-user.target

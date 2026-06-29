@@ -29,9 +29,33 @@
             mainProgram = "uart";
           };
         };
+
+      # The console front-end runs ON the device, so it cross-builds to a static aarch64-musl
+      # binary (same pattern as the pixel-* tools), pushed to the phone by the agentless floor.
+      frontendAarch64 = system:
+        let
+          cross = import nixpkgs {
+            inherit system;
+            crossSystem = { config = "aarch64-unknown-linux-musl"; };
+          };
+        in cross.rustPlatform.buildRustPackage {
+          pname = "uartfs-frontend";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [ "-p" "uartfs-frontend" ];
+          doCheck = false;
+          RUSTFLAGS = "-C target-feature=+crt-static";
+          meta = {
+            description = "On-device pty-owning console front-end (static aarch64-musl)";
+            license = nixpkgs.lib.licenses.asl20;
+            mainProgram = "uartfs-frontend";
+          };
+        };
     in {
       packages = forAll (system: rec {
         uartd = package system;
+        uartfs-frontend-aarch64 = frontendAarch64 system;
         default = uartd;
       });
 
