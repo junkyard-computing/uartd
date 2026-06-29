@@ -637,7 +637,7 @@ mod tests {
             }
             for b in buf.iter_mut() {
                 *ctr += 1;
-                if *ctr % period == 0 && *b != b'\n' && *b != b'\r' {
+                if (*ctr).is_multiple_of(period) && *b != b'\n' && *b != b'\r' {
                     *b ^= 0x20; // flip a bit; stays printable-ish, never a newline
                 }
             }
@@ -804,7 +804,7 @@ mod tests {
             other => panic!("expected Stalled on reboot, got {other:?}"),
         };
         assert_eq!(resume_from, 3);
-        assert!(t.link.files.get(&5).is_none(), "transfer not yet finished");
+        assert!(!t.link.files.contains_key(&5), "transfer not yet finished");
 
         // device "comes back": clear the reboot fault, then resume with the SAME xid.
         t.link.die_after = None;

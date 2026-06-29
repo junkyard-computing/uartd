@@ -86,12 +86,12 @@ impl Console for PtyConsole {
         self.sends += 1;
         let mut payload = text.to_string();
         // simulate a dropped character on the targeted send (inside the D= base64 value)
-        if Some(self.sends) == self.drop_at_send {
-            if let Some(pos) = payload.find("D=") {
-                let cut = pos + 3;
-                if cut < payload.len() {
-                    payload.remove(cut);
-                }
+        if Some(self.sends) == self.drop_at_send
+            && let Some(pos) = payload.find("D=")
+        {
+            let cut = pos + 3;
+            if cut < payload.len() {
+                payload.remove(cut);
             }
         }
         self.master.write_all(payload.as_bytes())?;
