@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/uart-core", "crates/uartd", "crates/uart", "crates/uartfs"]
+members = [
+    "crates/uart-core",
+    "crates/uartd",
+    "crates/uart",
+    "crates/uartfs",
+    "crates/uartfs-frontend",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +16,7 @@ license = "Apache-2.0"
 # Shared dependency versions, referenced by member crates via `<dep>.workspace = true`.
 [workspace.dependencies]
 uart-core = { path = "crates/uart-core" }
+uartfs = { path = "crates/uartfs" }
 clap = { version = "4.5", features = ["derive"] }
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }

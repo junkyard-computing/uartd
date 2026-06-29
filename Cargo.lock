@@ -547,6 +547,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "uartfs-frontend"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "libc",
+ "sha2",
+ "uart-core",
+ "uartfs",
+]
+
+[[package]]
 name = "unescaper"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
