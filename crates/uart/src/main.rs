@@ -64,6 +64,8 @@ enum Cmd {
     Log,
     /// Run a command on the device's bare shell, device-verified (agentless, reliable).
     /// Ignores echo; the command carries its own checksum and the reply is checksum-verified.
+    /// Args are joined with spaces (ssh-style), so quote anything with shell metacharacters as
+    /// a single argument: `uart run 'a; b | c'` (not `uart run a ';' b`).
     Run {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
